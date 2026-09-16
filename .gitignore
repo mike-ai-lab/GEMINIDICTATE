@@ -1,0 +1,28 @@
+# Runtime logs — regenerated on every run
+*.log
+*.log.err
+
+# Temporary / tail viewer scratch file
+_tail.txt
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS artifacts
+*.bak
+Thumbs.db
+.DS_Store
+
+# Screenshots and temp images
+*.png
+
+# Node dependencies — install locally with npm install
+node_modules/
+
+# User-specific Kiro workspace state
+.USER/
+
+# Kiro agent hooks (editor-local, not part of the app)
+.kiro/
