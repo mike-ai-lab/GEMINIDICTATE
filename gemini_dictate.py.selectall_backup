@@ -2881,6 +2881,155 @@ def _notes_toggle_pin(note):
     _notes_render_list()
 
 
+# ---------------------------------------------------------------------------
+# Dark custom context menu for the note editor
+# ---------------------------------------------------------------------------
+_ctx_popup = [None]   # holds the active popup so we can close it
+
+def _notes_context_menu(widget, event):
+    """Show a dark custom right-click menu for a tk.Text widget."""
+    if _ctx_popup[0]:
+        try: _ctx_popup[0].destroy()
+        except Exception: pass
+        _ctx_popup[0] = None
+
+    # --- Check states ---
+    has_sel = False
+    try:
+        widget.index("sel.first")
+        has_sel = True
+    except tk.TclError:
+        pass
+
+    try:
+        has_clip = bool(widget.clipboard_get())
+    except Exception:
+        has_clip = False
+
+    can_undo = bool(widget.edit("canundo"))
+    can_redo = bool(widget.edit("canredo"))
+
+    # --- Actions ---
+    def do_copy():
+        _close()
+        if has_sel:
+            widget.event_generate("<<Copy>>")
+
+    def do_cut():
+        _close()
+        if has_sel:
+            widget.event_generate("<<Cut>>")
+
+    def do_paste():
+        _close()
+        widget.event_generate("<<Paste>>")
+
+    def do_select_all():
+        _close()
+        widget.focus_set()
+        widget.tag_add("sel", "1.0", "end")
+        widget.mark_set("insert", "end")
+
+    def do_undo():
+        _close()
+        try:
+            widget.edit_undo()
+        except tk.TclError:
+            pass
+
+    def do_redo():
+        _close()
+        try:
+            widget.edit_redo()
+        except tk.TclError:
+            pass
+
+    # --- Palette ---
+    _CM_BG     = "#1c1c24"
+    _CM_HOVER  = "#2a2a38"
+    _CM_BORDER = "#303040"
+    _CM_TEXT   = "#e4e4e7"
+    _CM_DIM    = "#3a3a4a"
+    _CM_FONT   = (_UI_FONT or "Segoe UI", 9)
+    _CM_ICON_F = (_UI_FONT or "Segoe UI", 11)
+    _ITEM_H    = 34
+    _MENU_W    = 188
+
+    popup = tk.Toplevel(root)
+    popup.overrideredirect(True)
+    popup.attributes("-topmost", True)
+    popup.configure(bg=_CM_BORDER)
+    _ctx_popup[0] = popup
+
+    outer = tk.Frame(popup, bg=_CM_BG)
+    outer.pack(fill="both", expand=True, padx=1, pady=1)
+
+    def _close(*_):
+        try: popup.destroy()
+        except Exception: pass
+        _ctx_popup[0] = None
+
+    popup.bind("<FocusOut>", _close)
+    popup.bind("<Escape>",   _close)
+
+    # (icon, label, callback, enabled)
+    items = [
+        ("⎘", "Copy",       do_copy,       has_sel),
+        ("✂", "Cut",        do_cut,        has_sel),
+        ("⎗", "Paste",      do_paste,      has_clip),
+        None,
+        ("☰", "Select All", do_select_all, True),
+        None,
+        ("↩", "Undo",       do_undo,       can_undo),
+        ("↪", "Redo",       do_redo,       can_redo),
+    ]
+
+    for item in items:
+        if item is None:
+            tk.Frame(outer, bg="#2a2a38", height=1).pack(fill="x", padx=10, pady=3)
+            continue
+
+        icon_char, label, cmd, enabled = item
+        fg  = _CM_TEXT if enabled else _CM_DIM
+        cur = "hand2"  if enabled else "arrow"
+
+        row = tk.Frame(outer, bg=_CM_BG, height=_ITEM_H, cursor=cur)
+        row.pack(fill="x")
+        row.pack_propagate(False)
+
+        icon_lbl = tk.Label(row, text=icon_char, font=_CM_ICON_F,
+                            fg=fg, bg=_CM_BG, width=3, anchor="center")
+        icon_lbl.pack(side="left", padx=(6, 0))
+        text_lbl = tk.Label(row, text=label, font=_CM_FONT,
+                            fg=fg, bg=_CM_BG, anchor="w")
+        text_lbl.pack(side="left", fill="x", expand=True, padx=(4, 12))
+
+        if enabled:
+            def _bind_row(r, il, tl, c):
+                def _on(e):
+                    r.config(bg=_CM_HOVER)
+                    il.config(bg=_CM_HOVER)
+                    tl.config(bg=_CM_HOVER)
+                def _off(e):
+                    r.config(bg=_CM_BG)
+                    il.config(bg=_CM_BG)
+                    tl.config(bg=_CM_BG)
+                for w in (r, il, tl):
+                    w.bind("<Enter>",    _on)
+                    w.bind("<Leave>",    _off)
+                    w.bind("<Button-1>", lambda e, fn=c: fn())
+            _bind_row(row, icon_lbl, text_lbl, cmd)
+
+    popup.update_idletasks()
+    ph = popup.winfo_reqheight()
+    sw = popup.winfo_screenwidth()
+    sh = popup.winfo_screenheight()
+    x  = min(event.x_root + 2, sw - _MENU_W - 4)
+    y  = min(event.y_root + 2, sh - ph - 4)
+    popup.geometry(f"{_MENU_W}x{ph}+{x}+{y}")
+    popup.focus_set()
+
+
 def _notes_open_editor(note=None):
     # Pause canvas mousewheel while dialog open
     _notes_canvas.unbind_all("<MouseWheel>")
@@ -2950,9 +3099,11 @@ def _notes_open_editor(note=None):
     t_body = tk.Text(_dlg_outer, bg=_N["card_bg"], fg=_N["text_main"],
                      insertbackground=_N["text_dim"],
                      font=(_UI_FONT or "Segoe UI", 10), bd=0, relief="flat",
-                     padx=12, pady=10, wrap="word", undo=True, maxundo=-1,
+                     padx=12, pady=10, wrap="word",
+                     undo=True, maxundo=-1,
                      selectbackground="#1e3a5f", selectforeground="#e2e8f0")
     t_body.pack(fill="both", expand=True)
+    t_body.bind("<Button-3>", lambda e: _notes_context_menu(t_body, e))
 
     _PH = "Take a note…"
     def _ph_in(e):
@@ -2970,133 +3121,6 @@ def _notes_open_editor(note=None):
         t_body.config(fg=_N["text_dim"])
     t_body.bind("<FocusIn>",  _ph_in)
     t_body.bind("<FocusOut>", _ph_out)
-
-    # --- Custom dark context menu ---
-    _CTX_BG      = "#1e1e24"
-    _CTX_HOVER   = "#2d2d35"
-    _CTX_FG      = "#e4e4e7"
-    _CTX_FG_DIM  = "#52525b"
-    _CTX_SEP     = "#2a2a35"
-    _CTX_FONT    = (_UI_FONT or "Segoe UI", 10)
-
-    _ctx_win = [None]
-    _saved_sel = [None]   # (start, end) saved before right-click clears it
-
-    def _ctx_close():
-        if _ctx_win[0]:
-            try: _ctx_win[0].destroy()
-            except Exception: pass
-            _ctx_win[0] = None
-
-    def _restore_sel():
-        if _saved_sel[0]:
-            try:
-                t_body.tag_add("sel", _saved_sel[0][0], _saved_sel[0][1])
-                t_body.mark_set("insert", _saved_sel[0][1])
-            except Exception:
-                pass
-
-    def _ctx_show(e):
-        # Save selection BEFORE right-click clears it
-        try:
-            _saved_sel[0] = (t_body.index("sel.first"), t_body.index("sel.last"))
-        except Exception:
-            _saved_sel[0] = None
-
-        # Prevent right-click from moving the cursor / clearing selection
-        t_body.after(1, _restore_sel)
-
-        _ctx_close()
-
-        has_sel = _saved_sel[0] is not None
-
-        can_paste = False
-        try:
-            can_paste = bool(root.clipboard_get())
-        except Exception:
-            pass
-
-        can_undo = False
-        try:
-            t_body.edit_undo(); t_body.edit_redo()
-            can_undo = True
-        except Exception:
-            pass
-
-        can_redo = False
-        try:
-            t_body.edit_redo(); t_body.edit_undo()
-            can_redo = True
-        except Exception:
-            pass
-
-        def _do(cmd):
-            _restore_sel()
-            t_body.after(1, cmd)
-
-        menu_items = [
-            ("⧉  Copy",  lambda: _do(lambda: t_body.event_generate("<<Copy>>")),  not has_sel),
-            ("✂  Cut",   lambda: _do(lambda: t_body.event_generate("<<Cut>>")),   not has_sel),
-            ("⧈  Paste", lambda: _do(lambda: t_body.event_generate("<<Paste>>")), not can_paste),
-            None,
-            ("↩  Undo",  lambda: _do(lambda: t_body.edit_undo()), not can_undo),
-            ("↪  Redo",  lambda: _do(lambda: t_body.edit_redo()), not can_redo),
-        ]
-
-        win = tk.Toplevel(dlg)
-        win.overrideredirect(True)
-        win.attributes("-topmost", True)
-        win.configure(bg=_CTX_BG)
-        _ctx_win[0] = win
-
-        outer = tk.Frame(win, bg=_CTX_SEP, padx=1, pady=1)
-        outer.pack(fill="both", expand=True)
-        inner = tk.Frame(outer, bg=_CTX_BG)
-        inner.pack(fill="both", expand=True, padx=0, pady=4)
-
-        for item in menu_items:
-            if item is None:
-                tk.Frame(inner, bg=_CTX_SEP, height=1).pack(fill="x", padx=12, pady=3)
-                continue
-            label_text, cmd, disabled = item
-            fg = _CTX_FG_DIM if disabled else _CTX_FG
-            row = tk.Frame(inner, bg=_CTX_BG, cursor="arrow" if disabled else "hand2")
-            row.pack(fill="x", padx=0)
-            lbl = tk.Label(row, text=label_text, font=_CTX_FONT,
-                           fg=fg, bg=_CTX_BG, anchor="w",
-                           padx=20, pady=6)
-            lbl.pack(fill="x")
-
-            if not disabled:
-                def _enter(ev, r=row, l=lbl):
-                    r.config(bg=_CTX_HOVER); l.config(bg=_CTX_HOVER)
-                def _leave(ev, r=row, l=lbl):
-                    r.config(bg=_CTX_BG);    l.config(bg=_CTX_BG)
-                def _click(ev, c=cmd):
-                    _ctx_close(); dlg.after(10, c)
-                row.bind("<Enter>",    _enter)
-                row.bind("<Leave>",    _leave)
-                row.bind("<Button-1>", _click)
-                lbl.bind("<Enter>",    _enter)
-                lbl.bind("<Leave>",    _leave)
-                lbl.bind("<Button-1>", _click)
-
-        # Position next to cursor, keep on screen
-        win.update_idletasks()
-        mw = win.winfo_reqwidth()
-        mh = win.winfo_reqheight()
-        sw = win.winfo_screenwidth()
-        sh = win.winfo_screenheight()
-        mx = min(e.x_root, sw - mw - 4)
-        my = min(e.y_root, sh - mh - 4)
-        win.geometry(f"+{mx}+{my}")
-
-        # Close on any click outside
-        win.bind("<FocusOut>", lambda ev: _ctx_close())
-        dlg.bind("<Button-1>",   lambda ev: _ctx_close(), "+")
-        t_body.bind("<Button-1>", lambda ev: _ctx_close(), "+")
-
-    t_body.bind("<Button-3>", lambda e: (_ctx_show(e), "break")[1])
 
     dlg.bind("<Control-Return>", lambda e: _save())
 
@@ -3235,4 +3259,17 @@ try:
     _tray_icon.stop()
 except Exception:
     pass
+
+
+
+
+
+
+
+
+
+
+
+
+
 
