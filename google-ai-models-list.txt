@@ -1,0 +1,378 @@
+# Google AI Models
+
+> Cleaned and structured from the original `google-ai-models-list.txt`.
+> Pricing and availability below reflect the source file.
+
+## 1. Agent Models
+
+### Antigravity Agent Preview — September 2026
+- **Model ID:** `antigravity-preview-09-2026`
+- **Status:** New, Paid
+- **Description:** General-purpose autonomous agent running in a remote, Google-hosted Linux environment.
+- **Selected model:** Gemini 3.8 Flash
+- **Release date:** September 17, 2026
+- **Pricing:** Based on the configured model.
+
+### Antigravity Agent Preview — May 2026
+- **Model ID:** `antigravity-preview-05-2026`
+- **Status:** Paid
+- **Description:** General-purpose autonomous agent running in a remote, Google-hosted Linux environment.
+- **Selected model:** Gemini 3.8 Flash
+- **Release date:** July 21, 2026
+- **Pricing:** Based on the configured model.
+
+### Deep Research Preview
+- **Model ID:** `deep-research-preview-04-2026`
+- **Status:** Paid
+- **Description:** Long-running context gathering and synthesis agent optimized for speed and efficiency.
+- **Underlying models:** Gemini 3.1 Pro + Gemini 3 Flash
+- **Pricing:** Uses both Gemini 3.1 Pro and Gemini 3 Flash pricing.
+- **Knowledge cutoff:** January 2025
+- **Release date:** April 21, 2026
+
+### Deep Research Max Preview
+- **Model ID:** `deep-research-max-preview-04-2026`
+- **Status:** Paid
+- **Description:** Long-running research agent optimized for maximum search exhaustiveness and report comprehensiveness.
+- **Underlying models:** Gemini 3.1 Pro + Gemini 3 Flash
+- **Pricing:** Uses both Gemini 3.1 Pro and Gemini 3 Flash pricing.
+- **Knowledge cutoff:** January 2025
+- **Release date:** April 21, 2026
+
+---
+
+## 2. Gemini — General / Coding / Reasoning
+
+### Gemini 3.8 Flash
+- **Model ID:** `gemini-3.8-flash`
+- **Status:** New
+- **Description:** High-intelligence Flash model for long-horizon software engineering, autonomous agents, and complex enterprise workflows.
+- **Pricing:** Input $0.75 / Output $3.75
+- **Pricing note:** All context lengths; listed price through December 31, 2026.
+- **Release date:** September 2, 2026
+
+### Gemini 3.7 Flash
+- **Model ID:** `gemini-3.7-flash`
+- **Description:** High-speed Flash model for everyday coding, agentic tool use, and multi-step execution.
+- **Pricing:** Input $0.75 / Output $3.75
+- **Pricing note:** All context lengths; listed price through December 31, 2026.
+- **Release date:** August 13, 2026
+
+### Gemini 3.5 Flash Lite
+- **Model ID:** `gemini-3.5-flash-lite`
+- **Description:** Fast, cost-effective model optimized for high-throughput execution.
+- **Pricing:** Input $0.30 / Output $2.50
+- **Release date:** July 21, 2026
+
+### Gemini 3.1 Pro Preview
+- **Model ID:** `gemini-3.1-pro-preview`
+- **Description:** Advanced reasoning model with multimodal understanding and coding capabilities.
+- **Pricing:** Up to 200K tokens: Input $2.00 / Output $12.00
+- **Pricing:** Over 200K tokens: Input $4.00 / Output $18.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** February 12, 2026
+
+### Gemini 3.6 Flash
+- **Model ID:** `gemini-3.6-flash`
+- **Status:** Paid
+- **Description:** Previous-generation Flash model balancing speed and multimodal capabilities.
+- **Pricing:** Input $0.75 / Output $3.75
+- **Pricing note:** All context lengths; listed price through December 31, 2026.
+- **Release date:** July 21, 2026
+
+### Gemini 3.5 Flash
+- **Model ID:** `gemini-3.5-flash`
+- **Status:** Paid
+- **Description:** Earlier Flash model focused on speed and foundational performance.
+- **Pricing:** Input $1.50 / Output $9.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** May 19, 2026
+
+### Gemini 3.1 Flash Lite
+- **Model ID:** `gemini-3.1-flash-lite`
+- **Description:** Cost-efficient model optimized for high-volume agentic tasks, translation, and simple data processing.
+- **Pricing — Text/Image/Video:** Input $0.25 / Output $1.50
+- **Pricing — Audio:** Input $0.50 / Output $1.50
+- **Knowledge cutoff:** January 2025
+- **Release date:** May 7, 2026
+
+### Gemini 3 Flash Preview
+- **Model ID:** `gemini-3-flash-preview`
+- **Status:** Paid
+- **Description:** Legacy Flash model providing baseline speed and intelligence.
+- **Pricing:** Input $0.50 / Output $3.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** December 17, 2025
+
+### Gemini Pro Latest
+- **Model ID:** `gemini-pro-latest`
+- **Type:** Alias
+- **Points to:** `gemini-3.1-pro-preview`
+- **Description:** Alias to the latest Pro model; target changes over time.
+- **Pricing:** Up to 200K tokens: Input $2.00 / Output $12.00
+- **Pricing:** Over 200K tokens: Input $4.00 / Output $18.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** February 12, 2026
+
+### Gemini Flash Latest
+- **Model ID:** `gemini-flash-latest`
+- **Status:** New
+- **Type:** Alias
+- **Points to:** `gemini-3.8-flash`
+- **Description:** Alias to the latest Flash model; target changes over time.
+- **Pricing:** Input $0.75 / Output $3.75
+- **Pricing note:** All context lengths; listed price through December 31, 2026.
+- **Release date:** September 2, 2026
+
+### Gemini Flash-Lite Latest
+- **Model ID:** `gemini-flash-lite-latest`
+- **Type:** Alias
+- **Points to:** `gemini-3.5-flash-lite`
+- **Description:** Alias to the latest Flash-Lite model; target changes over time.
+- **Pricing:** Input $0.30 / Output $2.50
+- **Release date:** July 21, 2026
+
+---
+
+## 3. Gemini — Live / Speech / Audio
+
+### Gemini 3.8 Live
+- **Model ID:** `gemini-3.8-live`
+- **Status:** New
+- **Description:** Low-latency real-time dialogue model for fluid, uninterrupted conversations with background asynchronous function calling.
+- **Pricing — Text:** Input $0.75 / Output $4.50
+- **Pricing — Audio:** Input $3.00 / Output $12.00
+- **Pricing — Image/Video:** Input $1.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** September 15, 2026
+
+### Gemini 3.8 Live Extended Thinking
+- **Model ID:** `gemini-3.8-live-extended-thinking`
+- **Status:** New
+- **Description:** High-precision audio model capable of in-depth reasoning while speaking with natural verbal cues.
+- **Pricing — Text:** Input $0.75 / Output $4.50
+- **Pricing — Audio:** Input $3.00 / Output $12.00
+- **Pricing — Image/Video:** Input $1.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** September 15, 2026
+
+### Gemini 3.1 Flash Live Preview
+- **Model ID:** `gemini-3.1-flash-live-preview`
+- **Description:** Low-latency audio-to-audio model for real-time dialogue, acoustic nuance detection, numeric precision, and multimodal awareness.
+- **Pricing — Text:** Input $0.75 / Output $4.50
+- **Pricing — Audio:** Input $3.00 / Output $12.00
+- **Pricing — Image/Video:** Input $1.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** March 26, 2026
+
+### Gemini 3.5 Transcribe Live
+- **Model ID:** `gemini-3.5-transcribe-live`
+- **Status:** New
+- **Description:** Ultra-low-latency real-time streaming speech-to-text model for rapid live transcription updates.
+- **Pricing — Audio:** Input $3.50 / Output $21.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** August 26, 2026
+
+### Gemini 3.5 Live Translate Preview
+- **Model ID:** `gemini-3.5-live-translate-preview`
+- **Description:** Real-time speech-to-speech translation model supporting 70+ languages.
+- **Pricing — Audio:** Input $3.50 / Output $21.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** June 9, 2026
+
+### Gemini 3.5 Transcribe
+- **Model ID:** `gemini-3.5-transcribe`
+- **Status:** New
+- **Description:** Specialized high-accuracy speech-to-text model for pre-recorded files and static payloads, with structured transcripts and archival metadata.
+- **Pricing — Audio:** Input $2.00 / Output $12.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** August 26, 2026
+
+### Gemini 3.1 Flash TTS Preview
+- **Model ID:** `gemini-3.1-flash-tts-preview`
+- **Description:** Low-latency speech generation with steerable prompts and expressive audio tags.
+- **Pricing:** Input $1.00 / Output $20.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** April 15, 2026
+
+### Gemini 2.5 Pro Preview TTS
+- **Model ID:** `gemini-2.5-pro-preview-tts`
+- **Description:** Text-to-speech model optimized for natural, low-latency speech generation and controllable prompting.
+- **Pricing:** Input $1.00 / Output $20.00
+
+### Gemini 2.5 Flash Preview TTS
+- **Model ID:** `gemini-2.5-flash-preview-tts`
+- **Description:** Cost-efficient, low-latency, controllable text-to-speech model.
+- **Pricing — Audio:** Input $0.50 / Output $10.00
+
+---
+
+## 4. Gemini — Image Generation
+
+### Gemini 3.1 Flash Lite Image
+- **Model ID:** `gemini-3.1-flash-lite-image`
+- **Alias:** Nano Banana 2 Lite
+- **Description:** Small, cost-effective image generation and editing model designed for at-scale usage.
+- **Pricing — Text:** Input $0.25 / Output $1.50
+- **Pricing — Image:** Input $0.25 / Output $0.0336 per image
+- **Knowledge cutoff:** January 2025
+- **Release date:** June 30, 2026
+
+### Gemini 3.1 Flash Image
+- **Model ID:** `gemini-3.1-flash-image`
+- **Status:** Paid
+- **Alias:** Nano Banana 2
+- **Description:** Pro-level visual intelligence with Flash-speed efficiency and reality-grounded generation.
+- **Pricing — Text:** Input $0.50 / Output $3.00
+- **Pricing — Image:** Input $0.50 / Output $0.0672 per image
+- **Knowledge cutoff:** January 2025
+- **Release date:** May 28, 2026
+
+### Gemini 3 Pro Image
+- **Model ID:** `gemini-3-pro-image`
+- **Status:** Paid
+- **Alias:** Nano Banana Pro
+- **Description:** State-of-the-art image generation and editing model.
+- **Pricing — Text:** Input $2.00 / Output $12.00
+- **Pricing — Image:** Input $2.00 / Output $0.134 per image
+- **Knowledge cutoff:** January 2025
+- **Release date:** May 28, 2026
+
+### Gemini 2.5 Flash Image
+- **Model ID:** `gemini-2.5-flash-image`
+- **Status:** Paid
+- **Alias:** Nano Banana
+- **Description:** Image generation and editing model.
+- **Pricing — Text:** Input $0.30 / Output $2.50
+- **Pricing — Image:** Input $0.30 / Output $0.039 per image
+- **Knowledge cutoff:** June 2025
+- **Release date:** September 30, 2025
+
+---
+
+## 5. Gemini — Robotics
+
+### Gemini Robotics-ER 2 Preview
+- **Model ID:** `gemini-robotics-er-2-preview`
+- **Status:** New
+- **Description:** Embodied reasoning model for video understanding, spatial reasoning, multi-step tool orchestration, and multi-robot collaboration.
+- **Pricing:** Input $2.00 / Output $10.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** July 30, 2026
+
+### Gemini Robotics-ER 2 Streaming Preview
+- **Model ID:** `gemini-robotics-er-2-streaming-preview`
+- **Description:** Real-time text-streaming version optimized for faster robotics workflows.
+- **Pricing:** Input $2.00 / Output $10.00
+- **Knowledge cutoff:** January 2025
+- **Release date:** July 30, 2026
+
+---
+
+## 6. Music Generation — Lyria
+
+### Lyria 3.5
+- **Model ID:** `lyria-3.5`
+- **Status:** Paid
+- **Description:** Full-song generative model with enhanced audio fidelity, vocal clarity, and prompt adherence.
+- **Pricing:** $0.08 per generated song
+- **Knowledge cutoff:** January 2025
+- **Release date:** September 3, 2026
+
+### Lyria 3 Pro Preview
+- **Model ID:** `lyria-3-pro-preview`
+- **Status:** Paid
+- **Description:** Full-song generation with advanced compositional understanding and structural control.
+- **Pricing:** $0.08 per generated song
+- **Knowledge cutoff:** January 2025
+- **Release date:** March 25, 2026
+
+### Lyria 3 Clip Preview
+- **Model ID:** `lyria-3-clip-preview`
+- **Status:** Paid
+- **Description:** Low-latency music generation optimized for high-fidelity clips and rhythmic control.
+- **Pricing:** $0.04 per generated song/clip
+- **Knowledge cutoff:** January 2025
+- **Release date:** March 25, 2026
+
+---
+
+## 7. Video Generation
+
+### Gemini Omni 1.1 Flash
+- **Model ID:** `gemini-omni-1.1-flash`
+- **Status:** New, Paid
+- **Description:** Production-ready generative video with keyframe control, scene extension up to 30 seconds, and output upscaling up to 4K.
+- **Pricing — Text/Audio/Video:** Input $1.50 / Output $9.00
+- **Pricing — Video:** $17.50 output
+- **Knowledge cutoff:** January 2025
+- **Release date:** August 27, 2026
+
+### Gemini Omni Flash Preview
+- **Model ID:** `gemini-omni-flash-preview`
+- **Status:** Paid
+- **Description:** Video generation and conversational editing using text and image references.
+- **Pricing — Text/Audio/Video:** Input $1.50 / Output $9.00
+- **Pricing — Video:** $17.50 output
+- **Knowledge cutoff:** January 2025
+- **Release date:** June 30, 2026
+
+### Veo 3.1
+- **Model ID:** `veo-3.1-generate-preview`
+- **Status:** Paid
+- **Description:** Latest video generation model available to developers on the paid Gemini API tier.
+- **Pricing — 720p/1080p:** $0.40 per second
+- **Pricing — 4K:** $0.60 per second
+
+### Veo 3.1 Fast
+- **Model ID:** `veo-3.1-fast-generate-preview`
+- **Status:** Paid
+- **Description:** Faster version of Veo 3.1 optimized for speed and business use cases.
+- **Pricing — 720p:** $0.10 per second
+- **Pricing — 1080p:** $0.12 per second
+- **Pricing — 4K:** $0.30 per second
+
+### Veo 3.1 Lite
+- **Model ID:** `veo-3.1-lite-generate-preview`
+- **Status:** Paid
+- **Description:** Cost-efficient video generation model for rapid iteration and high-volume applications.
+- **Pricing — 720p:** $0.05 per second
+- **Pricing — 1080p:** $0.08 per second
+- **Release date:** March 31, 2026
+
+---
+
+## 8. Open-Weight Models — Gemma
+
+### Gemma 4 26B A4B IT
+- **Model ID:** `gemma-4-26b-a4b-it`
+- **Description:** Mixture-of-Experts model activating 4B parameters per inference for high-performance, cost-efficient server deployment.
+- **Knowledge cutoff:** January 2025
+- **Release date:** April 2, 2026
+
+### Gemma 4 31B IT
+- **Model ID:** `gemma-4-31b-it`
+- **Description:** Google DeepMind flagship open-weight dense model with a 256K context window and long-context architecture.
+- **Knowledge cutoff:** January 2025
+- **Release date:** April 2, 2026
+
+---
+
+## Quick Reference — Speech / Dictation Models
+
+| Model | Model ID | Primary Use |
+|---|---|---|
+| Gemini 3.5 Transcribe Live | `gemini-3.5-transcribe-live` | Real-time streaming speech-to-text |
+| Gemini 3.5 Transcribe | `gemini-3.5-transcribe` | Pre-recorded speech-to-text |
+| Gemini 3.8 Live | `gemini-3.8-live` | Real-time conversational audio |
+| Gemini 3.8 Live Extended Thinking | `gemini-3.8-live-extended-thinking` | Reasoning + real-time speech |
+| Gemini 3.1 Flash Live Preview | `gemini-3.1-flash-live-preview` | Real-time audio-to-audio |
+| Gemini 3.5 Live Translate Preview | `gemini-3.5-live-translate-preview` | Speech-to-speech translation |
+| Gemini 3.1 Flash TTS Preview | `gemini-3.1-flash-tts-preview` | Text-to-speech |
+
+## Notes
+
+- Model IDs are preserved exactly as provided in the source.
+- Pricing is reproduced from the source file and may be subject to change.
+- "Latest" models are aliases and can change their underlying target over time.
+- The source file also contained Google AI Studio/Playground interface text, which has been removed from this structured model list.

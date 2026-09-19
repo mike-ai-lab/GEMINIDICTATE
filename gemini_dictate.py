@@ -89,6 +89,12 @@ focus_lock = False        # when True, auto-stop on focus change is suppressed
 _last_audio_time = 0.0   # kept for compatibility; idle now uses GetLastInputInfo
 IDLE_STOP_SECONDS = 15.0 # auto-stop recording after this many seconds of user inactivity
 
+# Progressive paste serialization: async recv() enqueues word batches here;
+# the Tkinter main thread drains them one at a time so clipboard set→paste→restore
+# never overlaps with the next batch.
+_progressive_paste_queue = queue.Queue()
+_progressive_paste_busy = False  # True while a paste+restore cycle is in progress
+
 
 class LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong)]
@@ -1063,6 +1069,56 @@ def normalize_transcript_chunks(chunks):
     text = re.sub(r"([\(\[\{])\s+", r"\1", text)
     text = re.sub(r"\s+(['-])", r"\1", text)
     return text.strip()
+def insert_live_progressive(text):
+    """Enqueue a stable word batch for serialized paste on the Tkinter thread."""
+    if not text or not text.strip():
+        return False, "empty progressive text"
+    _progressive_paste_queue.put(text.strip())
+    _drain_progressive_queue()
+    return True, "queued"
+
+
+def _drain_progressive_queue():
+    """Drain the progressive paste queue one item at a time on the Tkinter thread.
+    Called from the main thread only. Does nothing if a paste is already in progress."""
+    global _progressive_paste_busy
+    if _progressive_paste_busy:
+        return
+    try:
+        batch = _progressive_paste_queue.get_nowait()
+    except queue.Empty:
+        return
+    _progressive_paste_busy = True
+    _do_progressive_paste(batch)
+
+
+def _do_progressive_paste(batch):
+    """Set clipboard to batch, paste it. No focus restore — during live recording
+    the target field is expected to remain focused. The final paste handles any
+    needed focus restore. No clipboard restore either — the original is restored
+    once by insert_live_final after the VAD turn completes."""
+    global _progressive_paste_busy
+    replacement = batch + " "
+    try:
+        ok, detail = clipboard_set_and_verify(replacement)
+        if not ok:
+            L("PROGRESSIVE CLIPBOARD SET FAILED: %s", detail)
+            _progressive_paste_busy = False
+            _drain_progressive_queue()
+            return
+
+        send_ctrl_v()
+        L("PROGRESSIVE PASTE DONE batch=%r", batch)
+        live_insert_status.set(f"LIVE: …{batch[-40:]}")
+    except Exception as e:
+        add_clipboard_fallback(batch, "progressive paste exception")
+        L("PROGRESSIVE PASTE EXCEPTION: %s", e)
+    finally:
+        _progressive_paste_busy = False
+        # Small gap so the paste keystroke is processed before next batch
+        root.after(40, _drain_progressive_queue)
+
+
 async def record_once(live_mode):
     global recording
 
@@ -1084,13 +1140,22 @@ async def record_once(live_mode):
     audio_sent = 0
     recv_done = asyncio.Event()
 
+    # LIVE progressive transcription state.
+    # A word is only committed to the target field once it has appeared at the
+    # same position in TWO consecutive interim updates unchanged. This prevents
+    # pasting Gemini's speculative guesses that get revised on the next frame.
+    live_committed_word_count = 0   # words already pasted (never decremented)
+    live_committed_text = ""        # exact text pasted so far (for final dedup)
+    live_prev_interim_words = []    # word list from the previous interim update
+    LIVE_SAFE_TAIL_WORDS = 2        # extra tail held back even after 2-frame confirm
+
     try:
         L("CONNECTING mode=%s model=%s", "LIVE" if live_mode else "BUFFERED", MODEL)
         async with client.aio.live.connect(model=MODEL, config=cfg) as session:
             L("GEMINI CONNECTED model=%s", MODEL)
 
             async def recv():
-                nonlocal recv_count
+                nonlocal recv_count, live_committed_word_count, live_committed_text, live_prev_interim_words
                 try:
                     async for response in session.receive():
                         recv_count += 1
@@ -1098,28 +1163,101 @@ async def record_once(live_mode):
                         if sc is None:
                             continue
 
-                        # INTERIM TRANSCRIPTION IS INTENTIONALLY NOT WRITTEN TO THE FIELD.
-                        # It is only a hypothesis and replacing it repeatedly was the source
-                        # of unreliable caret/undo/clipboard behavior. LIVE now behaves like
-                        # buffered mode: only authoritative finalized chunks are inserted.
+                        # --- Interim: only commit words confirmed in 2 consecutive frames ---
+                        interim = getattr(sc, "interim_input_transcription", None)
+                        if interim is not None and getattr(interim, "text", None):
+                            interim_text = str(interim.text).strip()
+                            root.after(0, update_live_transcript, interim_text, False)
 
+                            if live_mode:
+                                cur_words = interim_text.split()
+
+                                # Count how many leading words are identical between
+                                # the previous interim and the current one.
+                                # These have survived at least one Gemini revision cycle.
+                                confirmed_len = 0
+                                for a, b in zip(live_prev_interim_words, cur_words):
+                                    if a.casefold() == b.casefold():
+                                        confirmed_len += 1
+                                    else:
+                                        break
+
+                                # Commit the confirmed prefix minus the safe tail,
+                                # but only words beyond what's already been pasted.
+                                commit_up_to = max(confirmed_len - LIVE_SAFE_TAIL_WORDS, 0)
+                                if commit_up_to > live_committed_word_count:
+                                    new_words = cur_words[live_committed_word_count:commit_up_to]
+                                    batch = " ".join(new_words)
+                                    live_committed_word_count = commit_up_to
+                                    live_committed_text = " ".join(cur_words[:commit_up_to])
+                                    L("INTERIM PROGRESSIVE batch=%r confirmed_prefix=%d committed_words=%d",
+                                      batch, confirmed_len, live_committed_word_count)
+                                    # Enqueue on the Tkinter thread — serialized, never overlapping
+                                    root.after(0, insert_live_progressive, batch)
+
+                                live_prev_interim_words = cur_words
+
+                        # --- Final: paste only the words not yet committed ---
                         inp = getattr(sc, "input_transcription", None)
                         if inp is not None and getattr(inp, "text", None):
-                            txt = inp.text
+                            txt = str(inp.text).strip()
                             pieces.append(txt)
                             root.after(0, update_live_transcript, txt, True)
                             L("FINAL INPUT TRANSCRIPTION #%d chars=%d text=%r", recv_count, len(txt), txt)
                             if live_mode:
-                                def insert_final(chunk=txt):
-                                    ok, detail = insert_live_final(chunk)
-                                    if ok:
-                                        live_insert_status.set(f"LIVE OUTPUT: {len(chunk):,} chars")
-                                    else:
-                                        live_insert_status.set(detail)
-                                        focus_status.set("CLIPBOARD FALLBACK ACTIVE")
-                                        state_label.config(fg="#f59e0b")
-                                        L("LIVE FINAL INSERT FAILED chars=%d: %s", len(chunk), detail)
-                                root.after(0, insert_final)
+                                final_words = txt.split()
+                                # Find how many leading words of the final match
+                                # what we already committed, then only paste the rest.
+                                skip = 0
+                                committed_split = live_committed_text.split() if live_committed_text else []
+                                while (skip < len(committed_split)
+                                       and skip < len(final_words)
+                                       and committed_split[skip].casefold() == final_words[skip].casefold()):
+                                    skip += 1
+
+                                if skip < len(committed_split):
+                                    # Gemini revised words we already committed —
+                                    # we can't retract them, so skip by count only.
+                                    skip = min(live_committed_word_count, len(final_words))
+                                    L("LIVE FINAL HYPOTHESIS REVISION committed_words=%d final_words=%d skip=%d",
+                                      live_committed_word_count, len(final_words), skip)
+
+                                final_remainder = " ".join(final_words[skip:]).strip()
+                                # Reset state for next speech turn
+                                live_committed_word_count = 0
+                                live_committed_text = ""
+                                live_prev_interim_words = []
+
+                                if final_remainder:
+                                    def insert_final(chunk=final_remainder):
+                                        # Flush any queued progressive batches — the final
+                                        # paste will restore the clipboard, so pending
+                                        # progressive pastes must not fire after that.
+                                        while not _progressive_paste_queue.empty():
+                                            try:
+                                                _progressive_paste_queue.get_nowait()
+                                            except queue.Empty:
+                                                break
+                                        ok, detail = insert_live_final(chunk)
+                                        if ok:
+                                            live_insert_status.set(f"LIVE OUTPUT: {len(chunk):,} chars")
+                                        else:
+                                            live_insert_status.set(detail)
+                                            focus_status.set("CLIPBOARD FALLBACK ACTIVE")
+                                            state_label.config(fg="#f59e0b")
+                                            L("LIVE FINAL INSERT FAILED chars=%d: %s", len(chunk), detail)
+                                    root.after(0, insert_final)
+                                else:
+                                    # No remainder — just restore the clipboard now
+                                    # since no progressive batches are pending after this.
+                                    def restore_only():
+                                        while not _progressive_paste_queue.empty():
+                                            try:
+                                                _progressive_paste_queue.get_nowait()
+                                            except queue.Empty:
+                                                break
+                                        restore_saved_clipboard("final: no remainder, restore only")
+                                    root.after(0, restore_only)
 
                         if getattr(sc, "turn_complete", False):
                             L("SERVER TURN COMPLETE")
@@ -1770,6 +1908,13 @@ def start_record():
         except queue.Empty:
             break
 
+    # Flush any stale progressive paste batches from a previous session
+    while not _progressive_paste_queue.empty():
+        try:
+            _progressive_paste_queue.get_nowait()
+        except queue.Empty:
+            break
+
     # Start each session with a clean fallback state. The current clipboard is
     # preserved as the user's baseline; if a paste fails later, only failed
     # Gemini output is promoted to the safe clipboard fallback.
@@ -2007,6 +2152,18 @@ def set_mode(new_mode):
                      fg=SEL_FG if is_notes           else UNSEL_FG)
     toggle_prompt_panel(is_prompt)
     toggle_notes_panel(is_notes)
+
+    # NOTES uses the dedicated mic/orb in the New Note editor header.
+    # Hide the main widget mic completely while NOTES is active; restore it
+    # for LIVE / BUF / PRO. Also collapse its reserved grid column so the
+    # header does not leave an empty gap.
+    if is_notes:
+        btn.grid_remove()
+        pill.grid_columnconfigure(2, minsize=0, weight=0)
+    else:
+        pill.grid_columnconfigure(2, minsize=75, weight=0)
+        btn.grid()
+
     # Single geometry call after panels are shown/hidden — both expanded tabs use same height
     x, y = root.winfo_x(), root.winfo_y()
     if is_prompt or is_notes:
