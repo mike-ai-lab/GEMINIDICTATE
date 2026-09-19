@@ -110,6 +110,8 @@ def get_idle_seconds():
 mode = "live"
 stop_reason = ""
 prompt_mode_active = False   # True when the PROMPT panel is open and recording into it
+_prompt_confirmed_text = ""  # finalized transcript chunks only (for progressive display dedup)
+_prompt_progressive_text = ""  # progressive words accumulated within the current VAD turn
 _last_prompt_result = ""    # stores last rewritten output for undo
 _prompt_history = []        # list of dicts: {raw, result} — max 10
 _history_index = -1         # -1 = not browsing history; 0 = most recent
@@ -960,15 +962,17 @@ def insert_live_final(text):
 
     # PROMPT mode: land transcription in the widget textbox, not an external field
     if prompt_mode_active:
+        global _prompt_confirmed_text
         chunk = text.strip()
         try:
+            # Build the full confirmed transcript: all previous turns + this full turn.
+            # _prompt_confirmed_text accumulates across multiple VAD turns in one session.
+            _prompt_confirmed_text = (_prompt_confirmed_text.rstrip() + " " + chunk).strip() if _prompt_confirmed_text else chunk
             prompt_textbox.config(state="normal")
-            existing = prompt_textbox.get("1.0", "end-1c")
-            new_text = (existing + " " + chunk).strip() if existing else chunk
-            _apply_markdown_tags(prompt_textbox, new_text)
+            _apply_markdown_tags(prompt_textbox, _prompt_confirmed_text)
             _configure_md_tags_input(prompt_textbox)
             prompt_textbox.see("end")
-            L("PROMPT MODE TRANSCRIPT CHUNK chars=%d", len(chunk))
+            L("PROMPT MODE TRANSCRIPT CHUNK chars=%d total=%d", len(chunk), len(_prompt_confirmed_text))
         except Exception as e:
             L("PROMPT TEXTBOX INSERT ERROR: %s", e)
         return True, "appended to prompt textbox"
@@ -1096,15 +1100,33 @@ def _do_progressive_paste(batch):
     """Set clipboard to batch, paste it. No focus restore — during live recording
     the target field is expected to remain focused. The final paste handles any
     needed focus restore. No clipboard restore either — the original is restored
-    once by insert_live_final after the VAD turn completes."""
+    once by insert_live_final after the VAD turn completes.
+    In PROMPT mode there is no external target — progressive words are shown live
+    in the prompt textbox instead of being pasted via clipboard."""
     global _progressive_paste_busy
-    replacement = batch + " "
     try:
+        if prompt_mode_active:
+            # Show progressive words live in the prompt textbox.
+            # Render: confirmed turns so far + all words committed this turn so far.
+            # _prompt_progressive_text tracks the running committed text for this turn.
+            try:
+                global _prompt_progressive_text
+                _prompt_progressive_text = (_prompt_progressive_text.rstrip() + " " + batch).strip() if _prompt_progressive_text else batch
+                base = _prompt_confirmed_text.rstrip() if _prompt_confirmed_text else ""
+                preview = (base + " " + _prompt_progressive_text).strip() if base else _prompt_progressive_text
+                prompt_textbox.config(state="normal")
+                _apply_markdown_tags(prompt_textbox, preview)
+                _configure_md_tags_input(prompt_textbox)
+                prompt_textbox.see("end")
+                live_insert_status.set(f"LIVE: …{batch[-40:]}")
+            except Exception as e:
+                L("PROMPT PROGRESSIVE DISPLAY ERROR: %s", e)
+            return
+
+        replacement = batch + " "
         ok, detail = clipboard_set_and_verify(replacement)
         if not ok:
             L("PROGRESSIVE CLIPBOARD SET FAILED: %s", detail)
-            _progressive_paste_busy = False
-            _drain_progressive_queue()
             return
 
         send_ctrl_v()
@@ -1115,7 +1137,6 @@ def _do_progressive_paste(batch):
         L("PROGRESSIVE PASTE EXCEPTION: %s", e)
     finally:
         _progressive_paste_busy = False
-        # Small gap so the paste keystroke is processed before next batch
         root.after(40, _drain_progressive_queue)
 
 
@@ -1228,28 +1249,36 @@ async def record_once(live_mode):
                                 live_committed_text = ""
                                 live_prev_interim_words = []
 
-                                if final_remainder:
-                                    def insert_final(chunk=final_remainder):
-                                        # Flush any queued progressive batches — the final
-                                        # paste will restore the clipboard, so pending
-                                        # progressive pastes must not fire after that.
+                                if final_remainder or prompt_mode_active:
+                                    def insert_final(chunk=final_remainder, full=txt):
+                                        global _prompt_progressive_text
+                                        # Flush any queued progressive batches first.
                                         while not _progressive_paste_queue.empty():
                                             try:
                                                 _progressive_paste_queue.get_nowait()
                                             except queue.Empty:
                                                 break
-                                        ok, detail = insert_live_final(chunk)
+                                        # Reset per-turn progressive accumulator so the
+                                        # next turn starts fresh in the textbox.
+                                        _prompt_progressive_text = ""
+                                        # PROMPT mode gets the full final text so
+                                        # _prompt_confirmed_text is complete, not just
+                                        # the post-committed remainder.
+                                        insert_text = full if prompt_mode_active else chunk
+                                        if not insert_text:
+                                            restore_saved_clipboard("final: no remainder, restore only")
+                                            return
+                                        ok, detail = insert_live_final(insert_text)
                                         if ok:
-                                            live_insert_status.set(f"LIVE OUTPUT: {len(chunk):,} chars")
+                                            live_insert_status.set(f"LIVE OUTPUT: {len(insert_text):,} chars")
                                         else:
                                             live_insert_status.set(detail)
                                             focus_status.set("CLIPBOARD FALLBACK ACTIVE")
                                             state_label.config(fg="#f59e0b")
-                                            L("LIVE FINAL INSERT FAILED chars=%d: %s", len(chunk), detail)
+                                            L("LIVE FINAL INSERT FAILED chars=%d: %s", len(insert_text), detail)
                                     root.after(0, insert_final)
                                 else:
-                                    # No remainder — just restore the clipboard now
-                                    # since no progressive batches are pending after this.
+                                    # No remainder and not PROMPT — restore clipboard now.
                                     def restore_only():
                                         while not _progressive_paste_queue.empty():
                                             try:
@@ -1914,6 +1943,11 @@ def start_record():
             _progressive_paste_queue.get_nowait()
         except queue.Empty:
             break
+
+    # Reset prompt progressive display state
+    global _prompt_confirmed_text, _prompt_progressive_text
+    _prompt_confirmed_text = ""
+    _prompt_progressive_text = ""
 
     # Start each session with a clean fallback state. The current clipboard is
     # preserved as the user's baseline; if a paste fails later, only failed
@@ -3409,27 +3443,68 @@ def _notes_open_editor(note=None):
                                     pass
 
                     async def _receiver():
+                        nts_prev_words = []
+                        nts_committed_count = 0
+                        NTS_SAFE_TAIL = 2
                         async for response in session.receive():
                             if stop_evt.is_set():
                                 break
                             sc = getattr(response, "server_content", None)
                             if sc is None:
                                 continue
+
+                            # --- Interim: commit stable confirmed prefix word-by-word ---
+                            interim = getattr(sc, "interim_input_transcription", None)
+                            itxt = getattr(interim, "text", None) if interim is not None else None
+                            if itxt:
+                                cur_words = itxt.strip().split()
+                                confirmed_len = 0
+                                for a, b in zip(nts_prev_words, cur_words):
+                                    if a.casefold() == b.casefold():
+                                        confirmed_len += 1
+                                    else:
+                                        break
+                                commit_up_to = max(confirmed_len - NTS_SAFE_TAIL, 0)
+                                if commit_up_to > nts_committed_count:
+                                    new_words = cur_words[nts_committed_count:commit_up_to]
+                                    batch = " ".join(new_words)
+                                    nts_committed_count = commit_up_to
+                                    def _append_progressive(t=batch):
+                                        cur = t_body.get("1.0", "end-1c")
+                                        if cur in ("", "Take a note…"):
+                                            t_body.delete("1.0", "end")
+                                            t_body.config(fg=_N["text_main"])
+                                            t_body.insert("1.0", t + " ")
+                                        else:
+                                            if not cur.endswith(" "):
+                                                t_body.insert("end", " ")
+                                            t_body.insert("end", t + " ")
+                                        t_body.see("end")
+                                    root.after(0, _append_progressive)
+                                nts_prev_words = cur_words
+
+                            # --- Final: append only the words not yet committed ---
                             inp = getattr(sc, "input_transcription", None)
                             txt = getattr(inp, "text", None) if inp is not None else None
                             if txt:
-                                def _append(t=txt):
-                                    cur = t_body.get("1.0", "end-1c")
-                                    if cur in ("", "Take a note…"):
-                                        t_body.delete("1.0", "end")
-                                        t_body.config(fg=_N["text_main"])
-                                        t_body.insert("1.0", t)
-                                    else:
-                                        if not cur.endswith(" "):
-                                            t_body.insert("end", " ")
-                                        t_body.insert("end", t)
-                                    t_body.see("end")
-                                root.after(0, _append)
+                                final_words = txt.strip().split()
+                                skip = min(nts_committed_count, len(final_words))
+                                remainder = " ".join(final_words[skip:]).strip()
+                                nts_prev_words = []
+                                nts_committed_count = 0
+                                if remainder:
+                                    def _append_final(t=remainder):
+                                        cur = t_body.get("1.0", "end-1c")
+                                        if cur in ("", "Take a note…"):
+                                            t_body.delete("1.0", "end")
+                                            t_body.config(fg=_N["text_main"])
+                                            t_body.insert("1.0", t + " ")
+                                        else:
+                                            if not cur.endswith(" "):
+                                                t_body.insert("end", " ")
+                                            t_body.insert("end", t + " ")
+                                        t_body.see("end")
+                                    root.after(0, _append_final)
 
                     await asyncio.gather(_sender(), _receiver())
             except Exception as ex:
