@@ -1,4 +1,4 @@
-﻿import re
+import re
 import asyncio
 import ctypes
 import json
@@ -10,6 +10,7 @@ import threading
 import time
 import traceback
 import tkinter as tk
+import tkinter.font as tkfont
 
 import numpy as np
 import sounddevice as sd
@@ -18,6 +19,8 @@ from google import genai
 from google.genai import types
 
 MODEL = "gemini-3.5-transcribe-live"
+PROMPT_MODEL = "models/gemini-3.5-flash-lite"   # text→text model for prompt rewriting
+PROMPT_FALLBACKS = ["models/gemini-3.5-flash", "models/gemini-2.5-flash-lite"]
 DEVICE = 1
 RATE_IN = 44100
 RATE_OUT = 16000
@@ -99,6 +102,10 @@ def get_idle_seconds():
     return 0.0
 mode = "live"
 stop_reason = ""
+prompt_mode_active = False   # True when the PROMPT panel is open and recording into it
+_last_prompt_result = ""    # stores last rewritten output for undo
+_prompt_history = []        # list of dicts: {raw, result} — max 10
+_history_index = -1         # -1 = not browsing history; 0 = most recent
 
 # The widget is deliberately NOT used to capture the target on F8.
 # Focus is captured only after the user has clicked the desired text field and
@@ -919,6 +926,21 @@ def insert_live_final(text):
     """Insert one authoritative finalized Gemini transcription chunk."""
     if not text or not text.strip():
         return False, "empty final text"
+
+    # PROMPT mode: land transcription in the widget textbox, not an external field
+    if prompt_mode_active:
+        chunk = text.strip()
+        try:
+            prompt_textbox.config(state="normal")
+            existing = prompt_textbox.get("1.0", "end-1c")
+            new_text = (existing + " " + chunk).strip() if existing else chunk
+            _apply_markdown_tags(prompt_textbox, new_text)
+            _configure_md_tags_input(prompt_textbox)
+            prompt_textbox.see("end")
+            L("PROMPT MODE TRANSCRIPT CHUNK chars=%d", len(chunk))
+        except Exception as e:
+            L("PROMPT TEXTBOX INSERT ERROR: %s", e)
+        return True, "appended to prompt textbox"
     try:
         replacement = text.strip()
         if replacement.endswith('.'):
@@ -1177,6 +1199,448 @@ def update_live_transcript(text, final):
         transcript_preview.set("LIVE: " + text[-650:])
 
 
+PROMPT_SYSTEM = (
+    "You are an expert AI prompt engineer. "
+    "Rewrite the following rough spoken input into a clean, structured, "
+    "professional AI agent prompt. Output only the rewritten prompt, nothing else."
+)
+
+async def _call_rewrite_stream(raw_text, on_chunk):
+    """Stream Gemini text model response, calling on_chunk(text) for each piece."""
+    key = os.environ.get("GEMINI_API_KEY")
+    if not key:
+        raise RuntimeError("GEMINI_API_KEY is missing")
+    client = genai.Client(api_key=key)
+    contents = PROMPT_SYSTEM + "\n\nInput: " + raw_text
+    last_err = None
+    for model in [PROMPT_MODEL] + PROMPT_FALLBACKS:
+        try:
+            full = []
+            for chunk in client.models.generate_content_stream(model=model, contents=contents):
+                piece = chunk.text or ""
+                if piece:
+                    full.append(piece)
+                    await asyncio.to_thread(on_chunk, piece)
+            result = "".join(full).strip()
+            L("PROMPT REWRITE STREAM OK model=%s chars=%d", model, len(result))
+            return result
+        except Exception as e:
+            last_err = e
+            L("PROMPT REWRITE STREAM FAIL model=%s err=%s", model, e)
+    raise RuntimeError(f"All prompt models failed: {last_err}")
+
+
+def _resolve_font():
+    """Pick best available readable sans-serif font on this Windows machine."""
+    import tkinter.font as tkfont
+    available = set(tkfont.families())
+    for candidate in ("Roboto", "Inter", "Segoe UI Variable", "Segoe UI", "Arial"):
+        if candidate in available:
+            return candidate
+    return "Segoe UI"
+
+_UI_FONT = None  # resolved after root is created
+
+
+def _apply_markdown_tags(widget, text):
+    """Full markdown renderer for tk.Text — supports all standard syntax."""
+    widget.config(state="normal")
+    widget.delete("1.0", "end")
+    if not text:
+        return
+
+    lines = text.split("\n")
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+
+        # --- Fenced code block ---
+        if line.strip().startswith("```"):
+            lang = line.strip()[3:].strip()
+            code_lines = []
+            i += 1
+            while i < len(lines) and not lines[i].strip().startswith("```"):
+                code_lines.append(lines[i])
+                i += 1
+            code_text = "\n".join(code_lines)
+            widget.insert("end", code_text + "\n", "code_block")
+            i += 1
+            continue
+
+        # --- Table ---
+        if "|" in line and i + 1 < len(lines) and re.match(r"^[\|\s\-:]+$", lines[i + 1]):
+            # Parse header row
+            headers = [c.strip() for c in line.strip().strip("|").split("|")]
+            i += 1  # skip separator
+            # Alignment from separator
+            sep_cols = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+            aligns = []
+            for s in sep_cols:
+                if s.startswith(":") and s.endswith(":"):
+                    aligns.append("center")
+                elif s.endswith(":"):
+                    aligns.append("right")
+                else:
+                    aligns.append("left")
+            # Header row
+            widget.insert("end", " | ".join(headers) + "\n", "table_header")
+            widget.insert("end", "─" * 50 + "\n", "table_divider")
+            i += 1
+            while i < len(lines) and "|" in lines[i]:
+                cells = [c.strip() for c in lines[i].strip().strip("|").split("|")]
+                widget.insert("end", " | ".join(cells) + "\n", "table_row")
+                i += 1
+            continue
+
+        # --- Blockquote (nested OK) ---
+        if line.startswith(">"):
+            depth = 0
+            while depth < len(line) and line[depth] == ">":
+                depth += 1
+            content = line[depth:].lstrip()
+            tag = "blockquote2" if depth > 1 else "blockquote"
+            _insert_inline(widget, content + "\n", tag)
+            i += 1
+            continue
+
+        # --- Headings ---
+        m = re.match(r"^(#{1,6})\s+(.*)", line)
+        if m:
+            level = len(m.group(1))
+            content = m.group(2)
+            tag = f"h{level}"
+            _insert_inline(widget, content + "\n", tag)
+            i += 1
+            continue
+
+        # --- Horizontal rule ---
+        if re.match(r"^[-*_]{3,}\s*$", line):
+            widget.insert("end", "─" * 52 + "\n", "hr")
+            i += 1
+            continue
+
+        # --- Unordered list (nested by indent) ---
+        m = re.match(r"^(\s*)[-*+]\s+(.*)", line)
+        if m:
+            indent = len(m.group(1))
+            content = m.group(2)
+            tag = "bullet2" if indent >= 2 else "bullet"
+            prefix = "    • " if indent >= 2 else "  • "
+            _insert_inline(widget, prefix + content + "\n", tag)
+            i += 1
+            continue
+
+        # --- Ordered list ---
+        m = re.match(r"^(\s*)\d+[.)]\s+(.*)", line)
+        if m:
+            indent = len(m.group(1))
+            num_m = re.match(r"^(\s*)(\d+)[.)]\s+(.*)", line)
+            num = num_m.group(2) if num_m else "1"
+            content = num_m.group(3) if num_m else m.group(2)
+            tag = "numbered2" if indent >= 2 else "numbered"
+            prefix = f"      {num}. " if indent >= 2 else f"  {num}. "
+            _insert_inline(widget, prefix + content + "\n", tag)
+            i += 1
+            continue
+
+        # --- Blank line ---
+        if not line.strip():
+            widget.insert("end", "\n", "normal")
+            i += 1
+            continue
+
+        # --- Normal paragraph ---
+        _insert_inline(widget, line + "\n", "normal")
+        i += 1
+
+
+def _insert_inline(widget, text, base_tag):
+    """Insert text with inline markdown (bold, italic, code, links, images)."""
+    # Pattern order matters: images before links, bold+italic combos before singles
+    pattern = re.compile(
+        r"!\[([^\]]*)\]\([^\)]*(?:\s+\"[^\"]*\")?\)"  # image
+        r"|\[([^\]]+)\]\(([^\)]+)\)"                   # link
+        r"|\*\*\*(.+?)\*\*\*"                          # bold+italic
+        r"|___(.+?)___"                                 # bold+italic alt
+        r"|\*\*(.+?)\*\*"                               # bold
+        r"|__(.+?)__"                                   # bold alt
+        r"|\*(.+?)\*"                                   # italic
+        r"|_(.+?)_"                                     # italic alt
+        r"|`([^`]+)`"                                   # inline code
+    )
+    pos = 0
+    for m in pattern.finditer(text):
+        # Plain text before this match
+        if m.start() > pos:
+            widget.insert("end", text[pos:m.start()], base_tag)
+        g = m.groups()
+        if g[0] is not None:          # image
+            widget.insert("end", f"[image: {g[0]}]", "img")
+        elif g[1] is not None:        # link
+            widget.insert("end", g[1], "link")
+        elif g[3] is not None:        # bold+italic ***
+            widget.insert("end", g[3], "bold_italic")
+        elif g[4] is not None:        # bold+italic ___
+            widget.insert("end", g[4], "bold_italic")
+        elif g[5] is not None:        # bold **
+            widget.insert("end", g[5], "bold")
+        elif g[6] is not None:        # bold __
+            widget.insert("end", g[6], "bold")
+        elif g[7] is not None:        # italic *
+            widget.insert("end", g[7], "italic")
+        elif g[8] is not None:        # italic _
+            widget.insert("end", g[8], "italic")
+        elif g[9] is not None:        # inline code
+            widget.insert("end", g[9], "inline_code")
+        pos = m.end()
+    if pos < len(text):
+        widget.insert("end", text[pos:], base_tag)
+
+
+def _configure_md_tags_input(widget):
+    f = _UI_FONT or "Segoe UI"
+    widget.tag_configure("normal",      font=(f, 9),               foreground="#94a3b8")
+    widget.tag_configure("bold",        font=(f, 9, "bold"),       foreground="#e2e8f0")
+    widget.tag_configure("italic",      font=(f, 9, "italic"),     foreground="#94a3b8")
+    widget.tag_configure("bold_italic", font=(f, 9, "bold italic"),foreground="#e2e8f0")
+    widget.tag_configure("h1",          font=(f, 12, "bold"),      foreground="#f1f5f9", spacing1=6, spacing3=2)
+    widget.tag_configure("h2",          font=(f, 10, "bold"),      foreground="#e2e8f0", spacing1=4, spacing3=1)
+    widget.tag_configure("h3",          font=(f, 9, "bold"),       foreground="#cbd5e1", spacing1=3)
+    widget.tag_configure("h4",          font=(f, 9, "bold"),       foreground="#94a3b8", spacing1=2)
+    widget.tag_configure("h5",          font=(f, 9, "bold"),       foreground="#64748b", spacing1=2)
+    widget.tag_configure("h6",          font=(f, 9, "italic"),     foreground="#475569", spacing1=2)
+    widget.tag_configure("bullet",      font=(f, 9),               foreground="#94a3b8",  lmargin1=8,  lmargin2=18)
+    widget.tag_configure("bullet2",     font=(f, 9),               foreground="#64748b",  lmargin1=22, lmargin2=32)
+    widget.tag_configure("numbered",    font=(f, 9),               foreground="#94a3b8",  lmargin1=8,  lmargin2=22)
+    widget.tag_configure("numbered2",   font=(f, 9),               foreground="#64748b",  lmargin1=22, lmargin2=36)
+    widget.tag_configure("blockquote",  font=(f, 9, "italic"),     foreground="#64748b",  lmargin1=12, lmargin2=12)
+    widget.tag_configure("blockquote2", font=(f, 9, "italic"),     foreground="#475569",  lmargin1=24, lmargin2=24)
+    widget.tag_configure("code_block",  font=("Consolas", 8),      foreground="#fbbf24",  background="#12120e")
+    widget.tag_configure("inline_code", font=("Consolas", 8),      foreground="#fbbf24",  background="#12120e")
+    widget.tag_configure("table_header",font=(f, 9, "bold"),       foreground="#e2e8f0")
+    widget.tag_configure("table_divider",font=("Consolas", 7),     foreground="#334155")
+    widget.tag_configure("table_row",   font=(f, 9),               foreground="#94a3b8")
+    widget.tag_configure("hr",          font=("Consolas", 7),      foreground="#334155")
+    widget.tag_configure("link",        font=(f, 9, "underline"),  foreground="#60a5fa")
+    widget.tag_configure("img",         font=(f, 8, "italic"),     foreground="#818cf8")
+
+def _configure_md_tags_result(widget):
+    f = _UI_FONT or "Segoe UI"
+    widget.tag_configure("normal",      font=(f, 9),               foreground="#cbd5e1")
+    widget.tag_configure("bold",        font=(f, 9, "bold"),       foreground="#f1f5f9")
+    widget.tag_configure("italic",      font=(f, 9, "italic"),     foreground="#cbd5e1")
+    widget.tag_configure("bold_italic", font=(f, 9, "bold italic"),foreground="#f1f5f9")
+    widget.tag_configure("h1",          font=(f, 13, "bold"),      foreground="#34d399", spacing1=8, spacing3=3)
+    widget.tag_configure("h2",          font=(f, 11, "bold"),      foreground="#6ee7b7", spacing1=6, spacing3=2)
+    widget.tag_configure("h3",          font=(f, 10, "bold"),      foreground="#a7f3d0", spacing1=4, spacing3=1)
+    widget.tag_configure("h4",          font=(f, 9, "bold"),       foreground="#cbd5e1", spacing1=3)
+    widget.tag_configure("h5",          font=(f, 9, "bold"),       foreground="#94a3b8", spacing1=2)
+    widget.tag_configure("h6",          font=(f, 9, "italic"),     foreground="#64748b", spacing1=2)
+    widget.tag_configure("bullet",      font=(f, 9),               foreground="#94a3b8",  lmargin1=10, lmargin2=20)
+    widget.tag_configure("bullet2",     font=(f, 9),               foreground="#64748b",  lmargin1=26, lmargin2=36)
+    widget.tag_configure("numbered",    font=(f, 9),               foreground="#94a3b8",  lmargin1=10, lmargin2=24)
+    widget.tag_configure("numbered2",   font=(f, 9),               foreground="#64748b",  lmargin1=26, lmargin2=40)
+    widget.tag_configure("blockquote",  font=(f, 9, "italic"),     foreground="#34d399",  lmargin1=14, lmargin2=14)
+    widget.tag_configure("blockquote2", font=(f, 9, "italic"),     foreground="#6ee7b7",  lmargin1=28, lmargin2=28)
+    widget.tag_configure("code_block",  font=("Consolas", 8),      foreground="#fbbf24",  background="#12120e")
+    widget.tag_configure("inline_code", font=("Consolas", 8),      foreground="#fbbf24",  background="#12120e")
+    widget.tag_configure("table_header",font=(f, 9, "bold"),       foreground="#34d399")
+    widget.tag_configure("table_divider",font=("Consolas", 7),     foreground="#064e3b")
+    widget.tag_configure("table_row",   font=(f, 9),               foreground="#cbd5e1")
+    widget.tag_configure("hr",          font=("Consolas", 7),      foreground="#064e3b")
+    widget.tag_configure("link",        font=(f, 9, "underline"),  foreground="#34d399")
+    widget.tag_configure("img",         font=(f, 8, "italic"),     foreground="#6ee7b7")
+
+def submit_prompt():
+    """Stream Gemini rewrite into the result box with markdown rendering."""
+    raw = prompt_textbox.get("1.0", "end-1c").strip()
+    if not raw:
+        prompt_status.set("Nothing to rewrite — record something first")
+        return
+    prompt_submit_btn.config(state="disabled")
+    prompt_status.set("⏳ Rewriting…")
+    prompt_result_box.config(state="normal")
+    prompt_result_box.delete("1.0", "end")
+
+    _streamed_chunks = []
+
+    def on_chunk(piece):
+        _streamed_chunks.append(piece)
+
+    fut = asyncio.run_coroutine_threadsafe(_call_rewrite_stream(raw, on_chunk), loop)
+    _last_rendered = [0]  # how many chars of joined text we've rendered
+
+    def _stream_tick():
+        full_so_far = "".join(_streamed_chunks)
+        if full_so_far:
+            # Re-render with markdown on every tick (fast enough for streaming)
+            _apply_markdown_tags(prompt_result_box, full_so_far)
+            prompt_result_box.see("end")
+
+        if not fut.done():
+            root.after(80, _stream_tick)
+            return
+
+        # Final pass
+        try:
+            result = fut.result()
+            _apply_markdown_tags(prompt_result_box, result)
+            prompt_result_box.see("end")
+            clipboard_set_and_verify(result)
+            prompt_status.set("✓ Copied to clipboard")
+            # Save for undo
+            global _last_prompt_result
+            _last_prompt_result = result
+            # Save to history
+            global _prompt_history, _history_index
+            entry = {"raw": prompt_textbox.get("1.0", "end-1c").strip(), "result": result}
+            _prompt_history.insert(0, entry)
+            if len(_prompt_history) > 10:
+                _prompt_history.pop()
+            _history_index = -1
+            try:
+                undo_btn.config(state="normal", fg="#d4d4d8", bg=_P["panel_bg"])
+                _update_history_nav()
+            except Exception:
+                pass
+            L("PROMPT RESULT chars=%d", len(result))
+        except Exception as e:
+            prompt_status.set(f"⚠ {str(e)[:60]}")
+            L("PROMPT REWRITE ERROR: %s", e)
+        finally:
+            prompt_submit_btn.config(state="normal")
+
+    root.after(80, _stream_tick)
+
+
+def clear_prompt():
+    """Clear output only (not input), saving it for undo."""
+    global _last_prompt_result
+    current = prompt_result_box.get("1.0", "end-1c").strip()
+    if current:
+        _last_prompt_result = current
+        try:
+            undo_btn.config(state="normal", fg="#d4d4d8", bg=_P["panel_bg"])
+        except Exception:
+            pass
+    prompt_result_box.config(state="normal")
+    prompt_result_box.delete("1.0", "end")
+    prompt_status.set("")
+
+
+def new_prompt():
+    """Reset both input and output to a fresh state."""
+    global _last_prompt_result, _history_index
+    # Save current output for undo before wiping
+    current = prompt_result_box.get("1.0", "end-1c").strip()
+    if current:
+        _last_prompt_result = current
+        try:
+            undo_btn.config(state="normal", fg="#d4d4d8", bg=_P["panel_bg"])
+        except Exception:
+            pass
+    _history_index = -1
+    prompt_textbox.config(state="normal")
+    prompt_textbox.delete("1.0", "end")
+    prompt_result_box.config(state="normal")
+    prompt_result_box.delete("1.0", "end")
+    prompt_status.set("")
+    _char_count_var.set("0 chars")
+    try:
+        _update_history_nav()
+    except Exception:
+        pass
+
+
+def undo_prompt():
+    """Restore the last rewritten output."""
+    if not _last_prompt_result:
+        prompt_status.set("Nothing to undo")
+        return
+    _apply_markdown_tags(prompt_result_box, _last_prompt_result)
+    prompt_result_box.see("end")
+    prompt_status.set("↩ Restored")
+    try:
+        undo_btn.config(state="disabled", fg=_P["muted2"])
+    except Exception:
+        pass
+
+
+def _history_prev():
+    """Navigate to an older history entry."""
+    global _history_index
+    if not _prompt_history:
+        return
+    new_idx = _history_index + 1
+    if new_idx >= len(_prompt_history):
+        return
+    _history_index = new_idx
+    _load_history_entry(_history_index)
+
+
+def _history_next():
+    """Navigate to a newer history entry (or back to current draft)."""
+    global _history_index
+    if _history_index <= 0:
+        _history_index = -1
+        prompt_status.set("")
+        _update_history_nav()
+        return
+    _history_index -= 1
+    _load_history_entry(_history_index)
+
+
+def _load_history_entry(idx):
+    """Display a history entry without triggering a new generation."""
+    if idx < 0 or idx >= len(_prompt_history):
+        return
+    entry = _prompt_history[idx]
+    prompt_textbox.config(state="normal")
+    prompt_textbox.delete("1.0", "end")
+    prompt_textbox.insert("end", entry["raw"])
+    _apply_markdown_tags(prompt_result_box, entry["result"])
+    prompt_result_box.see("1.0")
+    total = len(_prompt_history)
+    prompt_status.set(f"History {total - idx}/{total}")
+    _update_char_count()
+    _update_history_nav()
+
+
+def _update_history_nav():
+    """Enable/disable nav arrows based on current position."""
+    try:
+        can_prev = len(_prompt_history) > 0 and _history_index < len(_prompt_history) - 1
+        can_next = _history_index >= 0
+        hist_prev_btn.config(state="normal" if can_prev else "disabled",
+                             fg="#d4d4d8" if can_prev else _P["muted2"])
+        hist_next_btn.config(state="normal" if can_next else "disabled",
+                             fg="#d4d4d8" if can_next else _P["muted2"])
+        if _prompt_history:
+            total = len(_prompt_history)
+            pos = total - _history_index if _history_index >= 0 else total
+            hist_count_label.config(text=f"{pos}/{total}")
+        else:
+            hist_count_label.config(text="")
+    except Exception:
+        pass
+
+
+def toggle_prompt_panel(show):
+    """Expand/collapse the PROMPT panel and resize the widget."""
+    global prompt_mode_active
+    prompt_mode_active = show
+    if show:
+        prompt_panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        x = root.winfo_x()
+        y = root.winfo_y()
+        root.geometry(f"460x500+{x}+{y}")
+    else:
+        prompt_panel.pack_forget()
+        x = root.winfo_x()
+        y = root.winfo_y()
+        root.geometry(f"460x54+{x}+{y}")
+
+
 def reset_widget_state():
     global last_external_focus, recording_focus, stop_reason, fallback_clipboard_text, fallback_active
     last_external_focus = None
@@ -1193,6 +1657,11 @@ def reset_widget_state():
     live_insert_status.set("")
     result_label.set("")
     status.set("READY")
+    # Reset prompt panel status label if it exists
+    try:
+        prompt_status.set("")
+    except Exception:
+        pass
 
 
 def start_record():
@@ -1227,26 +1696,35 @@ def start_record():
         candidate = last_external_focus
 
     if not candidate or not (is_editable_uia(candidate.get("uia")) or is_editable_window_fallback(candidate.get("top"), candidate.get("uia"))):
-        status.set("TEXT FIELD NOT READY")
-        focus_status.set(" CLICK A TEXT FIELD")
-        L("START REJECTED  current UIA focus is not editable current=%r candidate=%r", current_focus, candidate)
-        return
+        # PROMPT mode doesn't need an external text field — output goes into the widget
+        if not prompt_mode_active:
+            status.set("TEXT FIELD NOT READY")
+            focus_status.set(" CLICK A TEXT FIELD")
+            L("START REJECTED  current UIA focus is not editable current=%r candidate=%r", current_focus, candidate)
+            return
 
-    recording_focus = candidate
-    top = candidate["top"]
-    u = candidate["uia"]
-    description = describe_focus(top, u)
+    if prompt_mode_active:
+        # Sentinel focus: no external target; insert_live_final will route to textbox
+        recording_focus = {"top": None, "uia": None, "_prompt": True}
+        description = "PROMPT PANEL"
+        top = {}
+        u = {}
+    else:
+        recording_focus = candidate
+        top = candidate["top"]
+        u = candidate["uia"]
+        description = describe_focus(top, u)
 
-    # The START click can move Windows focus onto the widget. Immediately
-    # restore the captured field so the user gets the caret back without having
-    # to click the text field a second time.
-    restored, restore_detail, _used_win32_fallback = restore_target_focus(recording_focus)
-    if not restored:
-        recording_focus = None
-        status.set("TEXT FIELD NOT READY")
-        focus_status.set(" CLICK A TEXT FIELD")
-        L("START REJECTED  could not restore target focus: %s", restore_detail)
-        return
+        # The START click can move Windows focus onto the widget. Immediately
+        # restore the captured field so the user gets the caret back without having
+        # to click the text field a second time.
+        restored, restore_detail, _used_win32_fallback = restore_target_focus(recording_focus)
+        if not restored:
+            recording_focus = None
+            status.set("TEXT FIELD NOT READY")
+            focus_status.set(" CLICK A TEXT FIELD")
+            L("START REJECTED  could not restore target focus: %s", restore_detail)
+            return
 
     while not q.empty():
         try:
@@ -1293,6 +1771,7 @@ def start_record():
                bg=STOP, fg="#ffffff", activebackground="#fb7185", activeforeground="#ffffff")
     mode_live.config(state="disabled")
     mode_buf.config(state="disabled")
+    mode_pro.config(state="disabled")
     L(
         "START ACCEPTED mode=%s top=%s focus_uia=%r description=%r",
         mode_name,
@@ -1300,7 +1779,9 @@ def start_record():
         u,
         description,
     )
-    current_future = asyncio.run_coroutine_threadsafe(record_once(mode == "live"), loop)
+    current_future = asyncio.run_coroutine_threadsafe(
+        record_once(mode == "live" or prompt_mode_active), loop
+    )
     root.after(100, poll_result)
 
 
@@ -1311,7 +1792,9 @@ def stop_record(reason="user stop"):
     stop_reason = reason
     recording = False
     _focus_change_count = 0
-    if mode == "live":
+    if prompt_mode_active:
+        status.set("STOPPING  finishing transcription")
+    elif mode == "live":
         status.set("STOPPING  flushing last segment")
     else:
         status.set("FINALIZING  completing Gemini transcription")
@@ -1320,6 +1803,7 @@ def stop_record(reason="user stop"):
     btn.config(text="", state="disabled", bg="#27272a", fg="#a1a1aa", activebackground="#27272a", activeforeground="#a1a1aa")
     mode_live.config(state="disabled")
     mode_buf.config(state="disabled")
+    mode_pro.config(state="disabled")
     L("STOP received reason=%r", reason)
 
 
@@ -1395,8 +1879,19 @@ def poll_result():
 
     try:
         text = current_future.result()
-        mode_name = "LIVE" if mode == "live" else "BUFFERED"
-        if mode == "live":
+        mode_name = "LIVE" if mode == "live" else ("PROMPT" if prompt_mode_active else "BUFFERED")
+        if prompt_mode_active:
+            # In PROMPT mode, live chunks already landed in the textbox via insert_live_final.
+            # The final normalized text is the complete transcript — append anything not yet shown.
+            if text:
+                existing = prompt_textbox.get("1.0", "end-1c").strip()
+                if not existing:
+                    prompt_textbox.config(state="normal")
+                    prompt_textbox.insert("end", text)
+                    prompt_textbox.see("end")
+            prompt_status.set("Ready — click Rewrite or record more")
+            status.set("DONE  speak recorded")
+        elif mode == "live":
             result_label.set("LIVE INPUT: inserted directly into the field")
             status.set("DONE LIVE")
         else:
@@ -1429,6 +1924,7 @@ def poll_result():
                    bg="#f4f4f5", fg="#18181b", activebackground="#ffffff", activeforeground="#09090b")
         mode_live.config(state="normal")
         mode_buf.config(state="normal")
+        mode_pro.config(state="normal")
         focus_status.set(" Dictate")
         state_label.config(fg=MUTED)
         show_clipboard_fallback(False)
@@ -1439,13 +1935,26 @@ def set_mode(new_mode):
     if recording:
         return
     mode = new_mode
-    selected_bg = ACTIVE
-    unselected_bg = "#09090b"
-    mode_live.config(bg=selected_bg if mode == "live" else unselected_bg,
-                     fg=TEXT if mode == "live" else MUTED)
-    mode_buf.config(bg=selected_bg if mode == "buffered" else unselected_bg,
-                    fg=TEXT if mode == "buffered" else MUTED)
-    mode_help.set("LIVE" if mode == "live" else "BUFFER")
+    # Selected: white text on mid-dark bg with a subtle top border feel
+    # Unselected: muted on near-black
+    SEL_BG   = "#2d2d35"
+    UNSEL_BG = "#09090b"
+    SEL_FG   = "#f4f4f5"
+    UNSEL_FG = "#52525b"
+    is_prompt = (mode == "prompt")
+    mode_live.config(bg=SEL_BG if mode == "live" else UNSEL_BG,
+                     fg=SEL_FG if mode == "live" else UNSEL_FG)
+    mode_buf.config(bg=SEL_BG if mode == "buffered" else UNSEL_BG,
+                    fg=SEL_FG if mode == "buffered" else UNSEL_FG)
+    mode_pro.config(bg=SEL_BG if is_prompt else UNSEL_BG,
+                    fg=SEL_FG if is_prompt else UNSEL_FG)
+    toggle_prompt_panel(is_prompt)
+    if is_prompt:
+        mode_help.set("PROMPT")
+        focus_status.set(" Dictate prompt")
+        state_label.config(fg=MUTED)
+    else:
+        mode_help.set("LIVE" if mode == "live" else "BUFFER")
     L("MODE CHANGED mode=%s", mode)
 
 
@@ -1597,6 +2106,21 @@ def idle_stop_poll():
     root.after(500, idle_stop_poll)
 
 
+def restart_app():
+    """Cleanly shut down and relaunch the application via the bat launcher."""
+    import sys
+    L("RESTART REQUESTED — relaunching via START_Gemini_Dictate.bat")
+    bat = os.path.join(os.path.dirname(os.path.abspath(__file__)), "START_Gemini_Dictate.bat")
+    try:
+        subprocess.Popen(
+            [bat], shell=True, creationflags=CREATE_NO_WINDOW,
+            cwd=os.path.dirname(bat)
+        )
+    except Exception as e:
+        L("RESTART LAUNCH ERROR: %s", e)
+    root.after(300, lambda: os._exit(0))
+
+
 # ---------------------------------------------------------------------------
 # Compact dictation widget
 # ---------------------------------------------------------------------------
@@ -1616,6 +2140,32 @@ root.overrideredirect(True)
 root.attributes("-topmost", True)
 root.protocol("WM_DELETE_WINDOW", close_widget)
 root.withdraw()
+
+_UI_FONT = _resolve_font()
+L("UI FONT resolved to: %s", _UI_FONT)
+
+def _apply_ui_font_to_all():
+    """Walk all widgets and replace Segoe UI with the resolved font."""
+    if _UI_FONT == "Segoe UI":
+        return  # already correct, skip
+    def _walk(w):
+        try:
+            cfg = w.config()
+            if "font" in cfg:
+                current = w.cget("font")
+                if isinstance(current, str) and "Segoe UI" in current:
+                    w.config(font=current.replace("Segoe UI", _UI_FONT))
+                elif isinstance(current, (tuple, list)):
+                    new = tuple(
+                        _UI_FONT if (isinstance(p, str) and p == "Segoe UI") else p
+                        for p in current
+                    )
+                    w.config(font=new)
+        except Exception:
+            pass
+        for child in w.winfo_children():
+            _walk(child)
+    root.after(200, lambda: _walk(root))
 
 # The widget is intentionally non-activating. Clicking START/STOP must NOT
 # steal keyboard focus from the real text field.
@@ -1662,11 +2212,11 @@ pill = tk.Frame(frame, padx=9, pady=6, bg=BG)
 pill.pack(fill="both", expand=True)
 
 # Permanent columns: 1) status, 2) mode, 3) action, 4) lock, 5) close.
-pill.grid_columnconfigure(0, minsize=205, weight=0)
-pill.grid_columnconfigure(1, minsize=90, weight=0)
-pill.grid_columnconfigure(2, minsize=75, weight=0)
-pill.grid_columnconfigure(3, minsize=28, weight=0)
-pill.grid_columnconfigure(4, minsize=24, weight=0)
+pill.grid_columnconfigure(0, minsize=190, weight=1)
+pill.grid_columnconfigure(1, minsize=120, weight=0)
+pill.grid_columnconfigure(2, minsize=75,  weight=0)
+pill.grid_columnconfigure(3, minsize=28,  weight=0)
+pill.grid_columnconfigure(4, minsize=28,  weight=0)
 pill.grid_rowconfigure(0, minsize=42, weight=1)
 
 state_label = tk.Label(
@@ -1689,21 +2239,27 @@ clipboard_fallback_canvas.create_line(8, 12, 12, 12, fill="#22c55e", width=1.2, 
 clipboard_fallback_canvas.itemconfigure("clip", state="hidden")
 clipboard_fallback_label = clipboard_fallback_canvas
 
-mode_wrap = tk.Frame(pill, bg="#09090b", bd=1, relief="solid", width=90, height=30)
+mode_wrap = tk.Frame(pill, bg="#1a1a1f", bd=0, relief="flat", width=120, height=34)
 mode_wrap.grid(row=0, column=1, sticky="w", padx=(0, 8))
 mode_wrap.grid_propagate(False)
 mode_wrap.grid_columnconfigure(0, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(1, weight=1, uniform="mode")
+mode_wrap.grid_columnconfigure(2, weight=1, uniform="mode")
 mode_live = tk.Button(mode_wrap, text="LIVE", command=lambda: set_mode("live"),
-    font=("Segoe UI", 8, "bold"), fg=TEXT, bg=ACTIVE,
+    font=(_UI_FONT or "Segoe UI", 8, "bold"), fg="#f4f4f5", bg="#2d2d35",
     activebackground="#52525b", activeforeground="white", relief="flat", bd=0,
     cursor="hand2")
-mode_live.grid(row=0, column=0, sticky="nsew")
+mode_live.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
 mode_buf = tk.Button(mode_wrap, text="BUF", command=lambda: set_mode("buffered"),
-    font=("Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
+    font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
     activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
     cursor="hand2")
-mode_buf.grid(row=0, column=1, sticky="nsew")
+mode_buf.grid(row=0, column=1, sticky="nsew", padx=1, pady=1)
+mode_pro = tk.Button(mode_wrap, text="PRO", command=lambda: set_mode("prompt"),
+    font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
+    activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
+    cursor="hand2")
+mode_pro.grid(row=0, column=2, sticky="nsew", padx=1, pady=1)
 mode_label = mode_live
 
 btn = tk.Button(
@@ -1726,8 +2282,235 @@ close_btn = tk.Button(
     relief="flat", bd=0, font=("Segoe UI", 10, "bold"), fg=MUTED, bg=BG,
     activebackground="#27272a", activeforeground=TEXT, cursor="hand2"
 )
-close_btn.grid(row=0, column=4, sticky="e", padx=(3, 0))
+close_btn.grid(row=0, column=4, sticky="e", padx=(3, 6))
 
+# ---------------------------------------------------------------------------
+# PROMPT mode panel (hidden until PRO mode is selected)
+# ---------------------------------------------------------------------------
+
+# Color palette matching the React reference design
+_P = {
+    "panel_bg":      "#0d0d12",   # main panel bg
+    "input_bg":      "#0c0c10",   # raw speech box bg
+    "input_border":  "#1e1e2a",   # box border (white/10 equivalent)
+    "input_border_h":"#2e2e3e",   # focused border
+    "output_bg":     "#08080c",   # rewritten prompt box bg
+    "output_border": "#1a1a24",   # output box border
+    "accent":        "#10b981",   # emerald-500 — used for text & top bar only
+    "accent_dim":    "#065f46",   # emerald-900 — very subtle
+    "accent_text":   "#34d399",   # emerald-400 — readable on dark
+    "accent_badge":  "#064e3b",   # badge bg
+    "muted":         "#475569",   # slate-600
+    "muted2":        "#334155",   # slate-700
+    "text_main":     "#cbd5e1",   # slate-300
+    "text_dim":      "#64748b",   # slate-500
+    "btn_rewrite_bg":"#10b981",   # rewrite button bg
+    "btn_clear_bg":  "#1e1e2a",   # clear button bg
+    "divider":       "#1e1e2a",   # divider line
+    "mono_font":     "Consolas",
+}
+
+prompt_panel = tk.Frame(frame, bg=_P["panel_bg"], padx=0, pady=0)
+# Not packed by default — toggle_prompt_panel() shows/hides it
+
+prompt_status = tk.StringVar(value="")
+
+# Top accent line
+tk.Frame(prompt_panel, bg=_P["accent"], height=2).pack(fill="x")
+
+_panel_inner = tk.Frame(prompt_panel, bg=_P["panel_bg"], padx=10, pady=8)
+_panel_inner.pack(fill="both", expand=True)
+
+# --- Input section header ---
+input_header = tk.Frame(_panel_inner, bg=_P["panel_bg"])
+input_header.pack(fill="x", pady=(0, 4))
+tk.Label(input_header, text="RAW SPEECH INPUT",
+         font=(_UI_FONT or "Segoe UI", 7, "bold"),
+         fg=_P["muted"], bg=_P["panel_bg"], anchor="w").pack(side="left")
+tk.Label(input_header, text="speak → stop → rewrite",
+         font=(_UI_FONT or "Segoe UI", 7),
+         fg=_P["muted2"], bg=_P["panel_bg"], anchor="e").pack(side="right")
+
+# Input box
+input_border = tk.Frame(_panel_inner, bg=_P["input_border"], bd=0)
+input_border.pack(fill="x", pady=(0, 4))
+
+prompt_textbox = tk.Text(
+    input_border, height=4, wrap="word",
+    font=(_UI_FONT or "Segoe UI", 9),
+    fg=_P["text_main"], bg=_P["input_bg"],
+    insertbackground=_P["muted"],
+    relief="flat", bd=0,
+    padx=10, pady=7,
+    spacing1=2, spacing3=1,
+    selectbackground="#1e3a5f", selectforeground="#e2e8f0",
+)
+prompt_textbox.pack(fill="both", padx=1, pady=1)
+_configure_md_tags_input(prompt_textbox)
+
+# Char count footer
+_input_footer = tk.Frame(_panel_inner, bg=_P["panel_bg"])
+_input_footer.pack(fill="x", pady=(2, 6))
+_char_count_var = tk.StringVar(value="0 chars")
+tk.Label(_input_footer, textvariable=_char_count_var,
+         font=(_P["mono_font"], 7), fg=_P["text_dim"], bg=_P["panel_bg"],
+         anchor="e").pack(side="right")
+
+def _update_char_count(event=None):
+    n = len(prompt_textbox.get("1.0", "end-1c"))
+    _char_count_var.set(f"{n} chars")
+prompt_textbox.bind("<KeyRelease>", _update_char_count)
+
+def _make_context_menu(widget, allow_paste=False):
+    """Right-click context menu."""
+    m = tk.Menu(widget, tearoff=0, bg="#1e1e2a", fg=TEXT,
+                activebackground="#2e2e3e", activeforeground=TEXT,
+                bd=0, font=(_UI_FONT or "Segoe UI", 9))
+    if allow_paste:
+        m.add_command(label="Paste", command=lambda: widget.event_generate("<<Paste>>"))
+        m.add_separator()
+    m.add_command(label="Copy",       command=lambda: widget.event_generate("<<Copy>>"))
+    m.add_command(label="Select All", command=lambda: (widget.tag_add("sel", "1.0", "end"), None))
+    m.add_separator()
+    m.add_command(label="Clear",      command=lambda: widget.delete("1.0", "end"))
+    def _show(e):
+        try:
+            m.tk_popup(e.x_root, e.y_root)
+        finally:
+            m.grab_release()
+    widget.bind("<Button-3>", _show)
+
+_make_context_menu(prompt_textbox, allow_paste=True)
+
+# ---------------------------------------------------------------------------
+# Icon toolbar: [✦ Rewrite] [⊕] [↩] [✕]  +  status (truncated)  +  [←][n][→]
+# ---------------------------------------------------------------------------
+# Tooltip helper
+def _make_tooltip(widget, text):
+    tip = None
+    def _enter(e):
+        nonlocal tip
+        tip = tk.Toplevel(widget)
+        tip.wm_overrideredirect(True)
+        tip.attributes("-topmost", True)
+        tk.Label(tip, text=text, font=(_UI_FONT or "Segoe UI", 8),
+                 bg="#1e1e2a", fg=TEXT, padx=6, pady=3,
+                 relief="flat", bd=1).pack()
+        tip.geometry(f"+{e.x_root+12}+{e.y_root+16}")
+    def _leave(e):
+        nonlocal tip
+        if tip:
+            tip.destroy()
+            tip = None
+    widget.bind("<Enter>", _enter)
+    widget.bind("<Leave>", _leave)
+
+toolbar = tk.Frame(_panel_inner, bg=_P["panel_bg"])
+toolbar.pack(fill="x", pady=(0, 6))
+
+# Transparent button base — no bg box, hover shows subtle grey
+_HOVER_BG = "#2a2a35"
+
+def _icon_btn(parent, text, cmd, tooltip_text, fg="#d4d4d8",
+              bold=False, disabled=False, green=False):
+    """Create a flat icon button with hover-only background."""
+    f = (_UI_FONT or "Segoe UI", 11, "bold") if bold else (_UI_FONT or "Segoe UI", 11)
+    bg_normal = _P["btn_rewrite_bg"] if green else _P["panel_bg"]
+    fg_normal = "#0a0a0a" if green else fg
+    b = tk.Button(parent, text=text, command=cmd,
+                  font=f, fg=fg_normal, bg=bg_normal,
+                  activebackground="#34d399" if green else _HOVER_BG,
+                  activeforeground="#0a0a0a" if green else "#ffffff",
+                  relief="flat", bd=0, cursor="hand2",
+                  padx=6, pady=3,
+                  state="disabled" if disabled else "normal")
+    if not green:
+        b.bind("<Enter>", lambda e: b.config(bg=_HOVER_BG) if str(b.cget("state")) != "disabled" else None)
+        b.bind("<Leave>", lambda e: b.config(bg=_P["panel_bg"]))
+    _make_tooltip(b, tooltip_text)
+    return b
+
+# Action buttons (left side)
+prompt_submit_btn = _icon_btn(toolbar, "✦", submit_prompt, "Rewrite Prompt", bold=True, green=True)
+prompt_submit_btn.pack(side="left")
+
+_new_btn = _icon_btn(toolbar, "⊕", new_prompt, "New — clear both fields")
+_new_btn.pack(side="left", padx=(2, 0))
+
+undo_btn = _icon_btn(toolbar, "↩", undo_prompt, "Undo — restore last output", disabled=True)
+undo_btn.pack(side="left", padx=(2, 0))
+
+_clr_btn = _icon_btn(toolbar, "✕", clear_prompt, "Clear output")
+_clr_btn.pack(side="left", padx=(2, 0))
+
+# Status label — flexible, truncates rather than overflows
+_status_frame = tk.Frame(toolbar, bg=_P["panel_bg"])
+_status_frame.pack(side="left", fill="x", expand=True, padx=(8, 4))
+_status_lbl = tk.Label(_status_frame, textvariable=prompt_status,
+                       font=(_UI_FONT or "Segoe UI", 8),
+                       fg=_P["accent_text"], bg=_P["panel_bg"],
+                       anchor="w", justify="left", wraplength=1)
+_status_lbl.pack(fill="x", expand=True)
+
+def _update_status_wrap(event=None):
+    try:
+        w = _status_frame.winfo_width()
+        if w > 10:
+            _status_lbl.config(wraplength=w)
+    except Exception:
+        pass
+_status_frame.bind("<Configure>", _update_status_wrap)
+
+# History navigation: [3/10] ← →   (left-to-right, packed left from right anchor)
+hist_count_label = tk.Label(toolbar, text="",
+                            font=(_P["mono_font"], 7),
+                            fg=_P["muted"], bg=_P["panel_bg"],
+                            padx=2, anchor="e")
+hist_count_label.pack(side="left")
+
+hist_prev_btn = _icon_btn(toolbar, "←", _history_prev, "Older history", fg="#8b8b95", disabled=True)
+hist_prev_btn.pack(side="left", padx=(1, 0))
+
+hist_next_btn = _icon_btn(toolbar, "→", _history_next, "Newer history", fg="#8b8b95", disabled=True)
+hist_next_btn.pack(side="left", padx=(1, 0))
+
+# --- Divider ---
+tk.Frame(_panel_inner, bg=_P["divider"], height=1).pack(fill="x", pady=(0, 6))
+
+# --- Output section header ---
+output_header = tk.Frame(_panel_inner, bg=_P["panel_bg"])
+output_header.pack(fill="x", pady=(0, 4))
+
+_badge = tk.Frame(output_header, bg=_P["accent_badge"], padx=6, pady=2)
+_badge.pack(side="left")
+tk.Label(_badge, text="AI REWRITTEN PROMPT",
+         font=(_P["mono_font"], 7, "bold"),
+         fg=_P["accent_text"], bg=_P["accent_badge"]).pack()
+
+tk.Label(output_header, text="✓ auto-copied",
+         font=(_UI_FONT or "Segoe UI", 7),
+         fg=_P["accent_dim"], bg=_P["panel_bg"], anchor="e").pack(side="right")
+
+# Output box
+result_border = tk.Frame(_panel_inner, bg=_P["output_border"], bd=0)
+result_border.pack(fill="both", expand=True)
+
+prompt_result_box = tk.Text(
+    result_border, wrap="word",
+    font=(_UI_FONT or "Segoe UI", 9),
+    fg=_P["text_main"], bg=_P["output_bg"],
+    insertbackground=_P["accent_text"],
+    relief="flat", bd=0,
+    padx=10, pady=8,
+    spacing1=2, spacing3=2,
+    selectbackground="#1e3a5f", selectforeground="#e2e8f0",
+    cursor="xterm",
+)
+prompt_result_box.pack(fill="both", expand=True, padx=1, pady=1)
+_configure_md_tags_result(prompt_result_box)
+_make_context_menu(prompt_result_box)
+
+# ---------------------------------------------------------------------------
 # Allow the widget to be moved without changing focus semantics.
 def drag_start(event):
     root._drag_x = event.x_root - root.winfo_x()
@@ -1747,6 +2530,7 @@ root.after(FOCUS_POLL_MS, update_focus_tracking)
 root.after(30, hotkey_poll)
 root.after(500, _topmost_keepalive)
 root.after(2000, idle_stop_poll)
+_apply_ui_font_to_all()
 root.mainloop()
 
 try:
