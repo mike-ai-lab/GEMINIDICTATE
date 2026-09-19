@@ -1,0 +1,5 @@
+Traceback (most recent call last):
+  File "C:\Users\Administrator\Desktop\RealtimeSTTTest\GEMINIDICTATE\gemini_dictate.py", line 3257, in <module>
+    root.after(100, _tray_poll)
+                    ^^^^^^^^^^
+NameError: name '_tray_poll' is not defined. Did you mean: 'hotkey_poll'?

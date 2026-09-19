@@ -2209,6 +2209,34 @@ def _kill_stale_processes():
 
 
 # ---------------------------------------------------------------------------
+# Single-instance enforcement — kill any previous instance before starting
+# ---------------------------------------------------------------------------
+_PID_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".geminidictate.pid")
+
+def _enforce_single_instance():
+    """Kill any existing gemini_dictate process, then write our own PID."""
+    our_pid = os.getpid()
+    # Read stale PID file and kill that process first
+    if os.path.exists(_PID_FILE):
+        try:
+            old_pid = int(open(_PID_FILE).read().strip())
+            if old_pid != our_pid:
+                subprocess.run(["taskkill", "/F", "/PID", str(old_pid)],
+                               creationflags=CREATE_NO_WINDOW, capture_output=True)
+                L("KILLED PREVIOUS INSTANCE pid=%d", old_pid)
+        except Exception:
+            pass
+    # Also scan for any other python processes running our script
+    _kill_stale_processes()
+    # Write our PID
+    try:
+        open(_PID_FILE, "w").write(str(our_pid))
+    except Exception:
+        pass
+
+_enforce_single_instance()
+
+# ---------------------------------------------------------------------------
 # Compact dictation widget
 # ---------------------------------------------------------------------------
 _start_time = time.strftime("%Y-%m-%d %H:%M:%S")
@@ -2469,23 +2497,105 @@ def _update_char_count(event=None):
 prompt_textbox.bind("<KeyRelease>", _update_char_count)
 
 def _make_context_menu(widget, allow_paste=False):
-    """Right-click context menu."""
-    m = tk.Menu(widget, tearoff=0, bg="#1e1e2a", fg=TEXT,
-                activebackground="#2e2e3e", activeforeground=TEXT,
-                bd=0, font=(_UI_FONT or "Segoe UI", 9))
-    if allow_paste:
-        m.add_command(label="Paste", command=lambda: widget.event_generate("<<Paste>>"))
-        m.add_separator()
-    m.add_command(label="Copy",       command=lambda: widget.event_generate("<<Copy>>"))
-    m.add_command(label="Select All", command=lambda: (widget.tag_add("sel", "1.0", "end"), None))
-    m.add_separator()
-    m.add_command(label="Clear",      command=lambda: widget.delete("1.0", "end"))
+    """Custom dark context menu matching the NTS tab style."""
+    _CTX_BG    = "#1e1e24"
+    _CTX_HOVER = "#2d2d35"
+    _CTX_FG    = "#e4e4e7"
+    _CTX_DIM   = "#52525b"
+    _CTX_SEP   = "#2a2a35"
+    _CTX_FONT  = (_UI_FONT or "Segoe UI", 10)
+
+    _ctx = [None]
+    _sel = [None]
+
+    def _close():
+        if _ctx[0]:
+            try: _ctx[0].destroy()
+            except Exception: pass
+            _ctx[0] = None
+
+    def _restore():
+        if _sel[0]:
+            try:
+                widget.tag_add("sel", _sel[0][0], _sel[0][1])
+                widget.mark_set("insert", _sel[0][1])
+            except Exception:
+                pass
+
     def _show(e):
         try:
-            m.tk_popup(e.x_root, e.y_root)
-        finally:
-            m.grab_release()
-    widget.bind("<Button-3>", _show)
+            _sel[0] = (widget.index("sel.first"), widget.index("sel.last"))
+        except Exception:
+            _sel[0] = None
+        widget.after(1, _restore)
+        _close()
+
+        has_sel  = _sel[0] is not None
+        can_paste = allow_paste and bool(root.clipboard_get() if hasattr(root, 'clipboard_get') else False)
+        try:
+            can_paste = allow_paste and bool(root.clipboard_get())
+        except Exception:
+            can_paste = False
+
+        def _do(cmd):
+            _restore()
+            widget.after(1, cmd)
+
+        items = [
+            ("⧉  Copy",       lambda: _do(lambda: widget.event_generate("<<Copy>>")),    not has_sel),
+        ]
+        if allow_paste:
+            items.append(("✂  Cut",  lambda: _do(lambda: widget.event_generate("<<Cut>>")),   not has_sel))
+            items.append(("⧈  Paste",lambda: _do(lambda: widget.event_generate("<<Paste>>")), not can_paste))
+        items.append(None)
+        items.append(("⊞  Select All", lambda: widget.tag_add("sel", "1.0", "end"), False))
+        if allow_paste:
+            items.append(None)
+            items.append(("✕  Clear", lambda: widget.delete("1.0", "end"), False))
+
+        win = tk.Toplevel(widget)
+        win.overrideredirect(True)
+        win.attributes("-topmost", True)
+        win.configure(bg=_CTX_SEP)
+        _ctx[0] = win
+
+        outer = tk.Frame(win, bg=_CTX_SEP, padx=1, pady=1)
+        outer.pack(fill="both", expand=True)
+        inner = tk.Frame(outer, bg=_CTX_BG)
+        inner.pack(fill="both", expand=True, padx=0, pady=4)
+
+        for item in items:
+            if item is None:
+                tk.Frame(inner, bg=_CTX_SEP, height=1).pack(fill="x", padx=12, pady=3)
+                continue
+            txt, cmd, disabled = item
+            fg  = _CTX_DIM if disabled else _CTX_FG
+            row = tk.Frame(inner, bg=_CTX_BG, cursor="arrow" if disabled else "hand2")
+            row.pack(fill="x")
+            lbl = tk.Label(row, text=txt, font=_CTX_FONT,
+                           fg=fg, bg=_CTX_BG, anchor="w", padx=20, pady=6)
+            lbl.pack(fill="x")
+            if not disabled:
+                def _on_enter(ev, r=row, l=lbl):
+                    r.config(bg=_CTX_HOVER); l.config(bg=_CTX_HOVER)
+                def _on_leave(ev, r=row, l=lbl):
+                    r.config(bg=_CTX_BG);    l.config(bg=_CTX_BG)
+                def _on_click(ev, c=cmd):
+                    _close(); c()
+                for w in (row, lbl):
+                    w.bind("<Enter>",    _on_enter)
+                    w.bind("<Leave>",    _on_leave)
+                    w.bind("<Button-1>", _on_click)
+
+        win.update_idletasks()
+        mw, mh = win.winfo_reqwidth(), win.winfo_reqheight()
+        sw, sh = win.winfo_screenwidth(), win.winfo_screenheight()
+        win.geometry(f"+{min(e.x_root, sw-mw-4)}+{min(e.y_root, sh-mh-4)}")
+
+        win.bind("<FocusOut>", lambda ev: _close())
+        widget.bind("<Button-1>", lambda ev: _close(), "+")
+
+    widget.bind("<Button-3>", lambda e: (_show(e), "break")[1])
 
 _make_context_menu(prompt_textbox, allow_paste=True)
 
@@ -3140,17 +3250,42 @@ for w in (frame, pill):
     w.bind("<Button-1>", drag_start)
     w.bind("<B1-Motion>", drag_move)
 
-uia.start()
-threading.Thread(target=hotkey_message_thread, daemon=True).start()
-root.after(FOCUS_POLL_MS, update_focus_tracking)
-root.after(30, hotkey_poll)
-root.after(500, _topmost_keepalive)
-root.after(2000, idle_stop_poll)
-_apply_ui_font_to_all()
-
 # ---------------------------------------------------------------------------
 # System tray icon
 # ---------------------------------------------------------------------------
+# Thread-safe queue: tray callbacks post commands here; Tk polls and executes
+_tray_queue = queue.Queue()
+
+def _tray_poll():
+    """Drain tray command queue on the Tk main thread — no cross-thread Tk calls."""
+    try:
+        while True:
+            cmd = _tray_queue.get_nowait()
+            if cmd == "show":
+                if root.state() == "withdrawn":
+                    open_widget()
+                else:
+                    close_widget()
+            elif cmd == "kill_restart":
+                _kill_stale_processes()
+                restart_app()
+            elif cmd == "kill_procs":
+                _kill_stale_processes()
+            elif cmd == "close":
+                close_widget()
+            elif cmd == "exit":
+                try: _tray_icon.stop()
+                except Exception: pass
+                if recording:
+                    stop_record("exit")
+                try: uia.stop()
+                except Exception: pass
+                try: os.remove(_PID_FILE)
+                except Exception: pass
+                os._exit(0)
+    except queue.Empty:
+        pass
+    root.after(100, _tray_poll)
 def _make_tray_icon_image():
     """Load the app logo PNG for the tray icon."""
     try:
@@ -3168,39 +3303,24 @@ def _make_tray_icon_image():
 
 
 def _tray_show(icon, item):
-    root.after(0, lambda: (
-        open_widget() if root.state() == "withdrawn" else close_widget()
-    ))
+    _tray_queue.put("show")
 
 
 def _tray_kill_restart(icon, item):
-    """Kill stale processes and restart."""
-    def _do():
-        _kill_stale_processes()
-        restart_app()
-    root.after(0, _do)
+    _tray_queue.put("kill_restart")
 
 
 def _tray_kill_processes(icon, item):
-    """Kill all other gemini_dictate processes."""
-    root.after(0, _kill_stale_processes)
+    _tray_queue.put("kill_procs")
 
 
 def _tray_close_widget(icon, item):
-    root.after(0, close_widget)
+    _tray_queue.put("close")
 
 
 def _tray_exit(icon, item):
-    def _do():
-        icon.stop()
-        if recording:
-            stop_record("exit")
-        try:
-            uia.stop()
-        except Exception:
-            pass
-        os._exit(0)
-    root.after(0, _do)
+    _tray_queue.put("exit")
+
 
 
 import pystray
@@ -3225,14 +3345,28 @@ _tray_icon = pystray.Icon(
 threading.Thread(target=_tray_icon.run, daemon=True).start()
 L("TRAY ICON STARTED")
 
+uia.start()
+threading.Thread(target=hotkey_message_thread, daemon=True).start()
+root.after(FOCUS_POLL_MS, update_focus_tracking)
+root.after(30, hotkey_poll)
+root.after(100, _tray_poll)
+root.after(500, _topmost_keepalive)
+root.after(2000, idle_stop_poll)
+_apply_ui_font_to_all()
+
 root.mainloop()
 
+# Cleanup on normal exit
 try:
     uia.stop()
 except Exception:
     pass
 try:
     _tray_icon.stop()
+except Exception:
+    pass
+try:
+    os.remove(_PID_FILE)
 except Exception:
     pass
 
