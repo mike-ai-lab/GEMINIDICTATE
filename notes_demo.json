@@ -1,0 +1,26 @@
+[
+  {
+    "id": "23d3bd36-f75a-4f3e-9c9b-e9534e1ffa93",
+    "title": "Glassmorphism header task",
+    "content": "Add a glassmorphism header with 3 nav buttons, each expanding a dropdown. Use backdrop-filter blur and semi-transparent bg.",
+    "pinned": false,
+    "created_at": 1789818303.3599694,
+    "updated_at": 1789818303.3599694
+  },
+  {
+    "id": "d20057e2-71fc-4c73-8604-aec6daf645b2",
+    "title": "React table optimization",
+    "content": "Wrap rows in React.memo, add useVirtualizer for 500+ items, isolate filter state to prevent top-level re-renders.",
+    "pinned": true,
+    "created_at": 1789814703.3599694,
+    "updated_at": 1789821937.5938222
+  },
+  {
+    "id": "74ea16df-9e99-46e7-8f64-053e56d208ec",
+    "title": "FSFDSF",
+    "content": "SDFSDF",
+    "pinned": true,
+    "created_at": 1789822002.6650302,
+    "updated_at": 1789822002.6650302
+  }
+]

@@ -1,0 +1,20 @@
+[
+  {
+    "id": 1789833122,
+    "title": "PS C:\\Users\\Administrator\\Desktop\\RealtimeSTTTest\\GEMINIDICT",
+    "time": "6:52 PM",
+    "text": "PS C:\\Users\\Administrator\\Desktop\\RealtimeSTTTest\\GEMINIDICTATE> python demo_tabs.py\nTraceback (most recent call last):\n  File \"C:\\Users\\Administrator\\Desktop\\RealtimeSTTTest\\GEMINIDICTATE\\demo_tabs.py\", line 491, in <module>\n    root.mainloop()\n    ~~~~~~~~~~~~~^^\n  File \"C:\\Users\\Administrator\\AppData\\Local\\Programs\\Python\\Python313\\Lib\\tkinter\\__init__.py\", line 1599, in mainloop\n    self.tk.mainloop(n)\n    ~~~~~~~~~~~~~~~~^^^\nKeyboardInterrupt\nPS C:\\Users\\Administrator\\Desktop\\RealtimeSTTTest\\GEMINIDICTATE>"
+  },
+  {
+    "id": 1789832603,
+    "title": "ASDASD",
+    "time": "6:43 PM",
+    "text": "ADASDADASDA"
+  },
+  {
+    "id": 1789832523,
+    "title": "Note 1",
+    "time": "6:42 PM",
+    "text": "ADSASDThe dialog is too short for its content \u2014 the save button gets pushed out. The text box is `expand=True` and eats all the space. Fix is to give the dialog more height and stop the text box from expanding greedily.\n\nFixed. The problem was `fill=\"both\", expand=True` on the text frame \u2014 it consumed all remaining vertical space, leaving nothing for the button. Now:\n\n- text box uses a fixed `height=6` lines with `fill=\"x\"` only\n- dialog auto-sizes to fit all content via `pack` without a hardcoded geometry\n- `resizable(False, False)` so users can't accidentally break the layout again"
+  }
+]

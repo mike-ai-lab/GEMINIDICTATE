@@ -11,6 +11,7 @@ import time
 import traceback
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import ttk
 
 import numpy as np
 import sounddevice as sd
@@ -106,6 +107,30 @@ prompt_mode_active = False   # True when the PROMPT panel is open and recording 
 _last_prompt_result = ""    # stores last rewritten output for undo
 _prompt_history = []        # list of dicts: {raw, result} — max 10
 _history_index = -1         # -1 = not browsing history; 0 = most recent
+
+# Notes
+NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.json")
+_notes_data = []
+
+def _notes_load():
+    global _notes_data
+    try:
+        if os.path.exists(NOTES_FILE):
+            with open(NOTES_FILE, encoding="utf-8") as f:
+                _notes_data = json.load(f)
+            return
+    except Exception:
+        pass
+    _notes_data = []
+
+def _notes_save():
+    try:
+        with open(NOTES_FILE, "w", encoding="utf-8") as f:
+            json.dump(_notes_data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        L("NOTES SAVE ERROR: %s", e)
+
+_notes_load()
 
 # The widget is deliberately NOT used to capture the target on F8.
 # Focus is captured only after the user has clicked the desired text field and
@@ -1630,15 +1655,22 @@ def toggle_prompt_panel(show):
     global prompt_mode_active
     prompt_mode_active = show
     if show:
+        notes_panel.pack_forget()
         prompt_panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        x = root.winfo_x()
-        y = root.winfo_y()
-        root.geometry(f"460x500+{x}+{y}")
     else:
         prompt_panel.pack_forget()
-        x = root.winfo_x()
-        y = root.winfo_y()
-        root.geometry(f"460x54+{x}+{y}")
+
+
+def toggle_notes_panel(show):
+    """Expand/collapse the Notes panel and resize the widget."""
+    if show:
+        prompt_panel.pack_forget()
+        _notes_render_list()
+        notes_panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        _notes_canvas.bind_all("<MouseWheel>", _notes_mousewheel)
+    else:
+        notes_panel.pack_forget()
+        _notes_canvas.unbind_all("<MouseWheel>")
 
 
 def reset_widget_state():
@@ -1772,6 +1804,10 @@ def start_record():
     mode_live.config(state="disabled")
     mode_buf.config(state="disabled")
     mode_pro.config(state="disabled")
+    try:
+        mode_not.config(state="disabled")
+    except Exception:
+        pass
     L(
         "START ACCEPTED mode=%s top=%s focus_uia=%r description=%r",
         mode_name,
@@ -1925,6 +1961,10 @@ def poll_result():
         mode_live.config(state="normal")
         mode_buf.config(state="normal")
         mode_pro.config(state="normal")
+        try:
+            mode_not.config(state="normal")
+        except Exception:
+            pass
         focus_status.set(" Dictate")
         state_label.config(fg=MUTED)
         show_clipboard_fallback(False)
@@ -1935,23 +1975,35 @@ def set_mode(new_mode):
     if recording:
         return
     mode = new_mode
-    # Selected: white text on mid-dark bg with a subtle top border feel
-    # Unselected: muted on near-black
     SEL_BG   = "#2d2d35"
     UNSEL_BG = "#09090b"
     SEL_FG   = "#f4f4f5"
     UNSEL_FG = "#52525b"
     is_prompt = (mode == "prompt")
-    mode_live.config(bg=SEL_BG if mode == "live" else UNSEL_BG,
-                     fg=SEL_FG if mode == "live" else UNSEL_FG)
-    mode_buf.config(bg=SEL_BG if mode == "buffered" else UNSEL_BG,
-                    fg=SEL_FG if mode == "buffered" else UNSEL_FG)
-    mode_pro.config(bg=SEL_BG if is_prompt else UNSEL_BG,
-                    fg=SEL_FG if is_prompt else UNSEL_FG)
+    is_notes  = (mode == "notes")
+    mode_live.config(bg=SEL_BG if mode == "live"     else UNSEL_BG,
+                     fg=SEL_FG if mode == "live"     else UNSEL_FG)
+    mode_buf.config( bg=SEL_BG if mode == "buffered" else UNSEL_BG,
+                     fg=SEL_FG if mode == "buffered" else UNSEL_FG)
+    mode_pro.config( bg=SEL_BG if is_prompt          else UNSEL_BG,
+                     fg=SEL_FG if is_prompt          else UNSEL_FG)
+    mode_not.config( bg=SEL_BG if is_notes           else UNSEL_BG,
+                     fg=SEL_FG if is_notes           else UNSEL_FG)
     toggle_prompt_panel(is_prompt)
+    toggle_notes_panel(is_notes)
+    # Single geometry call after panels are shown/hidden — both expanded tabs use same height
+    x, y = root.winfo_x(), root.winfo_y()
+    if is_prompt or is_notes:
+        root.geometry(f"500x500+{x}+{y}")
+    else:
+        root.geometry(f"500x54+{x}+{y}")
     if is_prompt:
         mode_help.set("PROMPT")
         focus_status.set(" Dictate prompt")
+        state_label.config(fg=MUTED)
+    elif is_notes:
+        mode_help.set("NOTES")
+        focus_status.set(" Dictate")
         state_label.config(fg=MUTED)
     else:
         mode_help.set("LIVE" if mode == "live" else "BUFFER")
@@ -2066,19 +2118,23 @@ def hotkey_poll():
     try:
         while True:
             hotkey_queue.get_nowait()
+            # F8 toggles: open if hidden, hide if visible
             if root.state() == "withdrawn":
                 open_widget()
+            else:
+                close_widget()
     except queue.Empty:
         pass
 
     # Fallback: if global hotkey registration failed, poll F8 key state directly.
-    # GetAsyncKeyState returns negative (high bit set) when the key is currently down.
     if not _hotkey_registered:
         global _f8_was_down
         is_down = bool(user32.GetAsyncKeyState(VK_F8) & 0x8000)
         if is_down and not _f8_was_down:
             if root.state() == "withdrawn":
                 open_widget()
+            else:
+                close_widget()
         _f8_was_down = is_down
 
     root.after(30, hotkey_poll)
@@ -2107,9 +2163,10 @@ def idle_stop_poll():
 
 
 def restart_app():
-    """Cleanly shut down and relaunch the application via the bat launcher."""
+    """Kill any stale gemini_dictate processes, then relaunch."""
     import sys
-    L("RESTART REQUESTED — relaunching via START_Gemini_Dictate.bat")
+    L("RESTART REQUESTED — killing stale processes then relaunching")
+    _kill_stale_processes()
     bat = os.path.join(os.path.dirname(os.path.abspath(__file__)), "START_Gemini_Dictate.bat")
     try:
         subprocess.Popen(
@@ -2119,6 +2176,36 @@ def restart_app():
     except Exception as e:
         L("RESTART LAUNCH ERROR: %s", e)
     root.after(300, lambda: os._exit(0))
+
+
+def _kill_stale_processes():
+    """Kill other gemini_dictate.py processes (not this one)."""
+    our_pid = os.getpid()
+    try:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq python.exe", "/FO", "CSV", "/NH"],
+            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+        )
+        for line in result.stdout.splitlines():
+            parts = [p.strip('"') for p in line.split('","')]
+            if len(parts) >= 2:
+                try:
+                    pid = int(parts[1])
+                    if pid != our_pid:
+                        # Check if it's running our script
+                        cmd_result = subprocess.run(
+                            ["wmic", "process", "where", f"ProcessId={pid}",
+                             "get", "CommandLine", "/FORMAT:CSV"],
+                            capture_output=True, text=True, creationflags=CREATE_NO_WINDOW
+                        )
+                        if "gemini_dictate" in cmd_result.stdout.lower():
+                            subprocess.run(["taskkill", "/F", "/PID", str(pid)],
+                                           creationflags=CREATE_NO_WINDOW, capture_output=True)
+                            L("KILLED STALE PROCESS pid=%d", pid)
+                except Exception:
+                    pass
+    except Exception as e:
+        L("KILL STALE ERROR: %s", e)
 
 
 # ---------------------------------------------------------------------------
@@ -2133,13 +2220,27 @@ L("model=%s  api_key=%s", MODEL, "YES" if os.environ.get("GEMINI_API_KEY") else 
 
 root = tk.Tk()
 root.title("GeminiDictate")
-root.geometry("460x54+700+50")
+root.geometry("500x54+700+50")
 root.resizable(False, False)
 root.configure(bg="#121215")
 root.overrideredirect(True)
 root.attributes("-topmost", True)
 root.protocol("WM_DELETE_WINDOW", close_widget)
 root.withdraw()
+
+# App icon — used in taskbar and Alt+Tab even with overrideredirect
+try:
+    _ico_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "geminidictate.ico")
+    _logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini-dictate-logo.png")
+    if os.path.exists(_ico_path):
+        root.iconbitmap(_ico_path)
+    if os.path.exists(_logo_path):
+        from PIL import Image, ImageTk
+        _logo_img = Image.open(_logo_path).resize((32, 32), Image.LANCZOS)
+        _logo_tk  = ImageTk.PhotoImage(_logo_img)
+        root.iconphoto(True, _logo_tk)
+except Exception as _e:
+    L("ICON LOAD ERROR: %s", _e)
 
 _UI_FONT = _resolve_font()
 L("UI FONT resolved to: %s", _UI_FONT)
@@ -2209,11 +2310,11 @@ STOP = "#e11d48"
 frame = tk.Frame(root, padx=1, pady=1, bd=1, relief="solid", bg=BORDER)
 frame.pack(fill="both", expand=True)
 pill = tk.Frame(frame, padx=9, pady=6, bg=BG)
-pill.pack(fill="both", expand=True)
+pill.pack(fill="x")
 
 # Permanent columns: 1) status, 2) mode, 3) action, 4) lock, 5) close.
-pill.grid_columnconfigure(0, minsize=190, weight=1)
-pill.grid_columnconfigure(1, minsize=120, weight=0)
+pill.grid_columnconfigure(0, minsize=150, weight=1)
+pill.grid_columnconfigure(1, minsize=160, weight=0)
 pill.grid_columnconfigure(2, minsize=75,  weight=0)
 pill.grid_columnconfigure(3, minsize=28,  weight=0)
 pill.grid_columnconfigure(4, minsize=28,  weight=0)
@@ -2239,12 +2340,13 @@ clipboard_fallback_canvas.create_line(8, 12, 12, 12, fill="#22c55e", width=1.2, 
 clipboard_fallback_canvas.itemconfigure("clip", state="hidden")
 clipboard_fallback_label = clipboard_fallback_canvas
 
-mode_wrap = tk.Frame(pill, bg="#1a1a1f", bd=0, relief="flat", width=120, height=34)
+mode_wrap = tk.Frame(pill, bg="#1a1a1f", bd=0, relief="flat", width=160, height=34)
 mode_wrap.grid(row=0, column=1, sticky="w", padx=(0, 8))
 mode_wrap.grid_propagate(False)
 mode_wrap.grid_columnconfigure(0, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(1, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(2, weight=1, uniform="mode")
+mode_wrap.grid_columnconfigure(3, weight=1, uniform="mode")
 mode_live = tk.Button(mode_wrap, text="LIVE", command=lambda: set_mode("live"),
     font=(_UI_FONT or "Segoe UI", 8, "bold"), fg="#f4f4f5", bg="#2d2d35",
     activebackground="#52525b", activeforeground="white", relief="flat", bd=0,
@@ -2260,6 +2362,11 @@ mode_pro = tk.Button(mode_wrap, text="PRO", command=lambda: set_mode("prompt"),
     activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
     cursor="hand2")
 mode_pro.grid(row=0, column=2, sticky="nsew", padx=1, pady=1)
+mode_not = tk.Button(mode_wrap, text="NTS", command=lambda: set_mode("notes"),
+    font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
+    activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
+    cursor="hand2")
+mode_not.grid(row=0, column=3, sticky="nsew", padx=1, pady=1)
 mode_label = mode_live
 
 btn = tk.Button(
@@ -2524,6 +2631,388 @@ for w in (frame, pill):
     w.bind("<Button-1>", drag_start)
     w.bind("<B1-Motion>", drag_move)
 
+# ---------------------------------------------------------------------------
+# NOTES panel
+# ---------------------------------------------------------------------------
+_N = {
+    "panel_bg":     "#0d0d12",
+    "card_bg":      "#111118",
+    "card_border":  "#1e1e2a",
+    "accent":       "#f59e0b",
+    "accent_dim":   "#78350f",
+    "accent_text":  "#fbbf24",
+    "search_bg":    "#0c0c10",
+    "search_border":"#1e1e2a",
+    "text_main":    "#e4e4e7",
+    "text_dim":     "#64748b",
+    "text_muted":   "#475569",
+    "del_fg":       "#475569",
+    "divider":      "#1a1a24",
+}
+
+notes_panel = tk.Frame(frame, bg=_N["panel_bg"], padx=0, pady=0)
+# Not packed by default
+
+# Amber accent line — matches PRO's green line height
+tk.Frame(notes_panel, bg=_N["accent"], height=2).pack(fill="x")
+
+_ni = tk.Frame(notes_panel, bg=_N["panel_bg"], padx=10, pady=8)
+_ni.pack(fill="both", expand=True)
+
+# --- Header row: "QUICK NOTES" label left, search middle, "+ NEW NOTE" right ---
+# Matches PRO's single input_header row height exactly
+nh = tk.Frame(_ni, bg=_N["panel_bg"])
+nh.pack(fill="x", pady=(0, 4))
+
+tk.Label(nh, text="QUICK NOTES", font=(_UI_FONT or "Segoe UI", 7, "bold"),
+         fg=_N["text_muted"], bg=_N["panel_bg"], anchor="w",
+         bd=0, padx=0, pady=0).pack(side="left")
+
+_notes_add_lbl = tk.Label(nh, text="+ NEW NOTE",
+                           font=(_UI_FONT or "Segoe UI", 7, "bold"),
+                           fg=_N["accent_text"], bg=_N["panel_bg"],
+                           cursor="hand2", anchor="e", bd=0, padx=0, pady=0)
+_notes_add_lbl.pack(side="right")
+
+# --- Search bar ---
+_nsb = tk.Frame(_ni, bg=_N["search_border"], bd=0)
+_nsb.pack(fill="x", pady=(0, 4))
+_nsb_inner = tk.Frame(_nsb, bg=_N["search_bg"], padx=0, pady=0)
+_nsb_inner.pack(fill="x", padx=1, pady=1)
+
+_notes_search_var = tk.StringVar()
+_notes_search_entry = tk.Entry(_nsb_inner, textvariable=_notes_search_var,
+    bg=_N["search_bg"], fg=_N["text_main"],
+    insertbackground=_N["text_dim"],
+    font=(_UI_FONT or "Segoe UI", 9), bd=0, highlightthickness=0)
+_notes_search_entry.pack(side="left", fill="x", expand=True, padx=(8, 4), ipady=4)
+_notes_search_entry.insert(0, "Search notes…")
+_notes_search_entry.config(fg=_N["text_muted"])
+_notes_search_entry.bind("<FocusIn>",
+    lambda e: _notes_search_entry.delete(0, "end")
+    if _notes_search_entry.get() == "Search notes…" else None)
+_notes_search_entry.bind("<FocusOut>",
+    lambda e: (_notes_search_entry.insert(0, "Search notes…")
+               if not _notes_search_entry.get() else None))
+
+tk.Label(_nsb_inner, text="⌕", font=(_UI_FONT or "Segoe UI", 10),
+         fg=_N["text_dim"], bg=_N["search_bg"]).pack(side="right", padx=6)
+
+# --- Scrollable list ---
+_notes_list_container = tk.Frame(_ni, bg=_N["panel_bg"])
+_notes_list_container.pack(fill="both", expand=True)
+
+_notes_canvas = tk.Canvas(_notes_list_container, bg=_N["panel_bg"], highlightthickness=0, bd=0)
+
+# Custom dark scrollbar — a narrow Canvas drawn manually, no OS chrome
+_SB_W       = 6          # thumb width
+_SB_BG      = _N["panel_bg"]
+_SB_THUMB   = "#3a3a45"
+_SB_HOVER   = "#52525b"
+
+_notes_sb_canvas = tk.Canvas(_notes_list_container, width=_SB_W + 4,
+                              bg=_SB_BG, highlightthickness=0, bd=0)
+_notes_sb_canvas.pack(side="right", fill="y")
+_notes_canvas.pack(side="left", fill="both", expand=True)
+
+_sb_thumb_id  = None
+_sb_drag_data = {}
+
+def _sb_draw(first, last):
+    """Redraw the thumb given scroll fractions (0.0–1.0)."""
+    global _sb_thumb_id
+    _notes_sb_canvas.delete("all")
+    h = _notes_sb_canvas.winfo_height()
+    if h <= 1:
+        return
+    first, last = float(first), float(last)
+    if last - first >= 1.0:          # content fits — no thumb
+        return
+    ty = int(first * h) + 2
+    ty2 = int(last  * h) - 2
+    ty2 = max(ty2, ty + 16)          # minimum thumb height
+    _sb_thumb_id = _notes_sb_canvas.create_rectangle(
+        2, ty, _SB_W + 2, ty2,
+        fill=_SB_THUMB, outline="", tags="thumb")
+
+def _sb_set(first, last):
+    _sb_draw(first, last)
+
+_notes_canvas.configure(yscrollcommand=_sb_set)
+
+def _sb_click(e):
+    h = _notes_sb_canvas.winfo_height()
+    if h <= 1: return
+    _notes_canvas.yview_moveto(e.y / h)
+
+def _sb_drag_start(e):
+    _sb_drag_data["y"] = e.y
+    items = _notes_sb_canvas.find_withtag("thumb")
+    _sb_drag_data["thumb_y1"] = _notes_sb_canvas.coords(items[0])[1] if items else e.y
+
+def _sb_drag_move(e):
+    h = _notes_sb_canvas.winfo_height()
+    if h <= 1: return
+    dy = e.y - _sb_drag_data.get("y", e.y)
+    _sb_drag_data["y"] = e.y
+    _notes_canvas.yview_scroll(int(dy), "units")
+
+def _sb_hover(e):
+    _notes_sb_canvas.itemconfig("thumb", fill=_SB_HOVER)
+def _sb_leave(e):
+    _notes_sb_canvas.itemconfig("thumb", fill=_SB_THUMB)
+
+_notes_sb_canvas.bind("<Button-1>",   _sb_click)
+_notes_sb_canvas.bind("<ButtonPress-1>",  _sb_drag_start)
+_notes_sb_canvas.bind("<B1-Motion>",  _sb_drag_move)
+_notes_sb_canvas.bind("<Enter>",      _sb_hover)
+_notes_sb_canvas.bind("<Leave>",      _sb_leave)
+_notes_sb_canvas.bind("<Configure>",  lambda e: _notes_canvas.event_generate("<Configure>"))
+
+_notes_scroll_frame = tk.Frame(_notes_canvas, bg=_N["panel_bg"])
+_notes_cwin = _notes_canvas.create_window((0, 0), window=_notes_scroll_frame, anchor="nw")
+
+def _notes_update_scrollregion(e=None):
+    _notes_canvas.update_idletasks()
+    bbox = _notes_canvas.bbox("all")
+    if bbox:
+        ch = _notes_canvas.winfo_height()
+        _notes_canvas.configure(scrollregion=(0, 0, bbox[2], max(bbox[3], ch)))
+    # refresh thumb
+    _notes_canvas.update_idletasks()
+    try:
+        first, last = _notes_canvas.yview()
+        _sb_draw(first, last)
+    except Exception:
+        pass
+
+_notes_scroll_frame.bind("<Configure>", _notes_update_scrollregion)
+
+def _notes_configure_canvas(e):
+    _notes_canvas.itemconfig(_notes_cwin, width=e.width)
+    _notes_update_scrollregion()
+
+_notes_canvas.bind("<Configure>", _notes_configure_canvas)
+
+def _notes_mousewheel(e):
+    if _notes_scroll_frame.winfo_reqheight() > _notes_canvas.winfo_height():
+        _notes_canvas.yview_scroll(int(-1 * (e.delta / 120)), "units")
+
+
+def _notes_render_list():
+    for w in _notes_scroll_frame.winfo_children():
+        w.destroy()
+    q = _notes_search_entry.get().strip().lower()
+    if q == "search notes…":
+        q = ""
+    filtered = [n for n in _notes_data
+                if q in n.get("title", "").lower() or q in n.get("text", "").lower()]
+    # pinned first
+    filtered.sort(key=lambda n: (0 if n.get("pinned") else 1))
+    if not filtered:
+        tk.Label(_notes_scroll_frame, text="No notes yet — click + NEW NOTE",
+                 font=(_UI_FONT or "Segoe UI", 9),
+                 fg=_N["text_dim"], bg=_N["panel_bg"]).pack(pady=20)
+        return
+    for note in filtered:
+        _notes_make_card(_notes_scroll_frame, note)
+
+
+def _notes_make_card(parent, note):
+    is_pinned = bool(note.get("pinned"))
+    stripe_color = _N["accent"] if not is_pinned else "#22c55e"
+    stripe = tk.Frame(parent, bg=stripe_color, height=2)
+    stripe.pack(fill="x", pady=(6, 0))
+
+    card = tk.Frame(parent, bg=_N["card_bg"], padx=10, pady=8)
+    card.pack(fill="x", pady=(0, 2))
+
+    ch = tk.Frame(card, bg=_N["card_bg"])
+    ch.pack(fill="x")
+
+    del_lbl = tk.Label(ch, text="✕", font=(_UI_FONT or "Segoe UI", 8),
+                       fg=_N["del_fg"], bg=_N["card_bg"], cursor="hand2")
+    del_lbl.pack(side="right")
+    del_lbl.bind("<Button-1>", lambda e, n=note: _notes_delete(n))
+
+    pin_lbl = tk.Label(ch, text="📌" if is_pinned else "📍",
+                       font=(_UI_FONT or "Segoe UI", 8),
+                       fg="#22c55e" if is_pinned else _N["del_fg"],
+                       bg=_N["card_bg"], cursor="hand2")
+    pin_lbl.pack(side="right", padx=(0, 4))
+    pin_lbl.bind("<Button-1>", lambda e, n=note: _notes_toggle_pin(n))
+
+    ts = note.get("time") or note.get("updated_at", "")
+    if ts and isinstance(ts, (int, float)):
+        import datetime as _dt
+        ts = _dt.datetime.fromtimestamp(ts).strftime("%I:%M %p").lstrip("0")
+    if ts:
+        tk.Label(ch, text=str(ts), font=(_UI_FONT or "Segoe UI", 8),
+                 fg=_N["accent_text"], bg=_N["card_bg"]).pack(side="right", padx=(0, 6))
+
+    first_line = (note.get("text", "") or "").split("\n")[0][:50]
+    title_lbl = tk.Label(card, text=first_line,
+                         font=(_UI_FONT or "Segoe UI", 9, "bold"),
+                         fg=_N["text_main"], bg=_N["card_bg"], anchor="w")
+    title_lbl.pack(fill="x", pady=(3, 0))
+
+    preview = (note.get("text", "") or "").replace("\n", " ")
+    if len(preview) > 85:
+        preview = preview[:82] + "…"
+    text_lbl = tk.Label(card, text=preview,
+                        font=(_UI_FONT or "Segoe UI", 9),
+                        fg=_N["text_dim"], bg=_N["card_bg"],
+                        justify="left", anchor="w", wraplength=400)
+    text_lbl.pack(fill="x", pady=(2, 0))
+
+    for w in (card, title_lbl, text_lbl):
+        w.bind("<Double-Button-1>", lambda e, n=note: _notes_open_editor(n))
+
+
+def _notes_delete(note):
+    _notes_data.remove(note)
+    _notes_save()
+    _notes_render_list()
+
+
+def _notes_toggle_pin(note):
+    note["pinned"] = not note.get("pinned", False)
+    _notes_save()
+    _notes_render_list()
+
+
+def _notes_open_editor(note=None):
+    # Pause canvas mousewheel while dialog open
+    _notes_canvas.unbind_all("<MouseWheel>")
+
+    import datetime as _dt
+    dlg = tk.Toplevel(root)
+    dlg.overrideredirect(True)
+    dlg.configure(bg=BORDER)
+    dlg.attributes("-topmost", True)
+
+    # Center over main widget — must happen before update_idletasks
+    root.update_idletasks()
+    rx, ry = root.winfo_x(), root.winfo_y()
+    rw, rh = root.winfo_width(), root.winfo_height()
+    dlg.geometry(f"400x320+{rx + (rw - 400)//2}+{ry + (rh - 320)//2}")
+
+    # 1px border wrapper
+    _dlg_outer = tk.Frame(dlg, bg=BORDER, padx=1, pady=1)
+    _dlg_outer.pack(fill="both", expand=True)
+
+    def _on_close():
+        _notes_canvas.bind_all("<MouseWheel>", _notes_mousewheel)
+        dlg.destroy()
+
+    dlg.protocol("WM_DELETE_WINDOW", _on_close)
+
+    # Amber header bar
+    hdr = tk.Frame(_dlg_outer, bg=_N["accent"], padx=8, pady=6)
+    hdr.pack(fill="x")
+
+    def _save():
+        content = t_body.get("1.0", "end-1c").strip()
+        if not content or content == "Take a note…":
+            _on_close()
+            return
+        ts = _dt.datetime.now().strftime("%I:%M %p").lstrip("0")
+        if note:
+            note["title"] = content.split("\n")[0][:60]
+            note["text"]  = content
+            note["time"]  = ts
+        else:
+            _notes_data.insert(0, {
+                "id":    int(_dt.datetime.now().timestamp()),
+                "title": content.split("\n")[0][:60],
+                "time":  ts,
+                "text":  content,
+            })
+        _notes_save()
+        _notes_render_list()
+        _on_close()
+
+    save_lbl = tk.Label(hdr, text="✓ Save", font=(_UI_FONT or "Segoe UI", 10, "bold"),
+                        fg="#0a0a0a", bg=_N["accent"], cursor="hand2")
+    save_lbl.pack(side="left")
+    save_lbl.bind("<Button-1>", lambda e: _save())
+
+    close_lbl = tk.Label(hdr, text="✕", font=(_UI_FONT or "Segoe UI", 11, "bold"),
+                         fg="#0a0a0a", bg=_N["accent"], cursor="hand2")
+    close_lbl.pack(side="right", padx=(6, 0))
+    close_lbl.bind("<Button-1>", lambda e: _on_close())
+
+    def _hdr_ds(e): dlg._dx = e.x_root - dlg.winfo_x(); dlg._dy = e.y_root - dlg.winfo_y()
+    def _hdr_dm(e): dlg.geometry(f"+{e.x_root - dlg._dx}+{e.y_root - dlg._dy}")
+    hdr.bind("<Button-1>", _hdr_ds)
+    hdr.bind("<B1-Motion>", _hdr_dm)
+
+    t_body = tk.Text(_dlg_outer, bg=_N["card_bg"], fg=_N["text_main"],
+                     insertbackground=_N["text_dim"],
+                     font=(_UI_FONT or "Segoe UI", 10), bd=0, relief="flat",
+                     padx=12, pady=10, wrap="word",
+                     selectbackground="#1e3a5f", selectforeground="#e2e8f0")
+    t_body.pack(fill="both", expand=True)
+
+    _PH = "Take a note…"
+    def _ph_in(e):
+        if t_body.get("1.0", "end-1c") == _PH:
+            t_body.delete("1.0", "end")
+            t_body.config(fg=_N["text_main"])
+    def _ph_out(e):
+        if not t_body.get("1.0", "end-1c").strip():
+            t_body.insert("1.0", _PH)
+            t_body.config(fg=_N["text_dim"])
+    if note:
+        t_body.insert("1.0", note.get("text", ""))
+    else:
+        t_body.insert("1.0", _PH)
+        t_body.config(fg=_N["text_dim"])
+    t_body.bind("<FocusIn>",  _ph_in)
+    t_body.bind("<FocusOut>", _ph_out)
+
+    dlg.bind("<Control-Return>", lambda e: _save())
+
+    def _dlg_scroll(e):
+        t_body.yview_scroll(int(-1 * (e.delta / 120)), "units")
+    dlg.bind_all("<MouseWheel>", _dlg_scroll)
+
+    # Resize grip — bottom-right corner
+    grip = tk.Label(_dlg_outer, text="⇲", font=(_UI_FONT or "Segoe UI", 9),
+                    fg=_N["text_dim"], bg=_N["card_bg"], cursor="size_nw_se")
+    grip.pack(side="bottom", anchor="e", padx=4, pady=2)
+    def _grip_ds(e):
+        dlg._gx = e.x_root; dlg._gy = e.y_root
+        dlg._gw = dlg.winfo_width(); dlg._gh = dlg.winfo_height()
+    def _grip_dm(e):
+        nw = max(300, dlg._gw + (e.x_root - dlg._gx))
+        nh = max(200, dlg._gh + (e.y_root - dlg._gy))
+        dlg.geometry(f"{nw}x{nh}")
+    grip.bind("<Button-1>", _grip_ds)
+    grip.bind("<B1-Motion>", _grip_dm)
+
+    t_body.focus_set()
+    if note:
+        t_body.mark_set("insert", "end")
+
+
+_notes_add_lbl.bind("<Button-1>", lambda e: _notes_open_editor())
+_notes_search_entry.bind("<KeyRelease>", lambda e: _notes_render_list())
+
+# ---------------------------------------------------------------------------
+# Allow the widget to be moved without changing focus semantics.
+def drag_start(event):
+    root._drag_x = event.x_root - root.winfo_x()
+    root._drag_y = event.y_root - root.winfo_y()
+
+
+def drag_move(event):
+    root.geometry(f"+{event.x_root - root._drag_x}+{event.y_root - root._drag_y}")
+
+for w in (frame, pill):
+    w.bind("<Button-1>", drag_start)
+    w.bind("<B1-Motion>", drag_move)
+
 uia.start()
 threading.Thread(target=hotkey_message_thread, daemon=True).start()
 root.after(FOCUS_POLL_MS, update_focus_tracking)
@@ -2531,10 +3020,92 @@ root.after(30, hotkey_poll)
 root.after(500, _topmost_keepalive)
 root.after(2000, idle_stop_poll)
 _apply_ui_font_to_all()
+
+# ---------------------------------------------------------------------------
+# System tray icon
+# ---------------------------------------------------------------------------
+def _make_tray_icon_image():
+    """Load the app logo PNG for the tray icon."""
+    try:
+        from PIL import Image
+        logo = os.path.join(os.path.dirname(os.path.abspath(__file__)), "gemini-dictate-logo.png")
+        img = Image.open(logo).convert("RGBA").resize((64, 64), Image.LANCZOS)
+        return img
+    except Exception:
+        # Fallback: generate amber GD circle
+        from PIL import Image, ImageDraw
+        img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
+        d = ImageDraw.Draw(img)
+        d.ellipse([2, 2, 62, 62], fill="#f59e0b")
+        return img
+
+
+def _tray_show(icon, item):
+    root.after(0, lambda: (
+        open_widget() if root.state() == "withdrawn" else close_widget()
+    ))
+
+
+def _tray_kill_restart(icon, item):
+    """Kill stale processes and restart."""
+    def _do():
+        _kill_stale_processes()
+        restart_app()
+    root.after(0, _do)
+
+
+def _tray_kill_processes(icon, item):
+    """Kill all other gemini_dictate processes."""
+    root.after(0, _kill_stale_processes)
+
+
+def _tray_close_widget(icon, item):
+    root.after(0, close_widget)
+
+
+def _tray_exit(icon, item):
+    def _do():
+        icon.stop()
+        if recording:
+            stop_record("exit")
+        try:
+            uia.stop()
+        except Exception:
+            pass
+        os._exit(0)
+    root.after(0, _do)
+
+
+import pystray
+
+_tray_menu = pystray.Menu(
+    pystray.MenuItem("Show / Hide Widget  (F8)", _tray_show, default=True),
+    pystray.Menu.SEPARATOR,
+    pystray.MenuItem("Kill Stale Processes & Restart", _tray_kill_restart),
+    pystray.MenuItem("Kill Stale Processes", _tray_kill_processes),
+    pystray.Menu.SEPARATOR,
+    pystray.MenuItem("Close Widget", _tray_close_widget),
+    pystray.MenuItem("Exit", _tray_exit),
+)
+
+_tray_icon = pystray.Icon(
+    "GeminiDictate",
+    _make_tray_icon_image(),
+    "GeminiDictate",
+    _tray_menu,
+)
+
+threading.Thread(target=_tray_icon.run, daemon=True).start()
+L("TRAY ICON STARTED")
+
 root.mainloop()
 
 try:
     uia.stop()
+except Exception:
+    pass
+try:
+    _tray_icon.stop()
 except Exception:
     pass
 
