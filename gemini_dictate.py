@@ -82,6 +82,21 @@ f8_last = False
 _f8_was_down = False
 _focus_change_count = 0  # consecutive polls showing a different editable during recording
 focus_lock = False        # when True, auto-stop on focus change is suppressed
+_last_audio_time = 0.0   # kept for compatibility; idle now uses GetLastInputInfo
+IDLE_STOP_SECONDS = 15.0 # auto-stop recording after this many seconds of user inactivity
+
+
+class LASTINPUTINFO(ctypes.Structure):
+    _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_ulong)]
+
+def get_idle_seconds():
+    """Return seconds since the last keyboard or mouse event (system-wide)."""
+    lii = LASTINPUTINFO()
+    lii.cbSize = ctypes.sizeof(LASTINPUTINFO)
+    if user32.GetLastInputInfo(ctypes.byref(lii)):
+        idle_ms = kernel32.GetTickCount() - lii.dwTime
+        return idle_ms / 1000.0
+    return 0.0
 mode = "live"
 stop_reason = ""
 
@@ -972,11 +987,14 @@ def insert_live_final(text):
 
 # Gemini live transcription# ---------------------------------------------------------------------------
 
+_SILENCE_THRESHOLD = 200  # int16 RMS below this = silence (adjust if too sensitive)
+
 def mic_cb(indata, frames, time_info, status):
     try:
         if status:
             L("MIC STATUS: %s", status)
-        q.put_nowait(indata[:, 0].copy())
+        block = indata[:, 0].copy()
+        q.put_nowait(block)
     except queue.Full:
         L("MIC QUEUE FULL  DROPPED AUDIO BLOCK")
     except Exception:
@@ -1557,6 +1575,28 @@ def hotkey_poll():
     root.after(30, hotkey_poll)
 
 
+def idle_stop_poll():
+    """Auto-stop recording if no keyboard/mouse interaction for IDLE_STOP_SECONDS."""
+    if recording:
+        idle = get_idle_seconds()
+        if idle >= IDLE_STOP_SECONDS:
+            L("IDLE AUTO-STOP  no user interaction for %.1fs", idle)
+            focus_status.set(" IDLE — stopping")
+            state_label.config(fg="#f59e0b")
+            root.after(0, stop_record, "idle auto-stop (no interaction for 15s)")
+        elif idle >= (IDLE_STOP_SECONDS - 5):
+            remaining = max(1, int(IDLE_STOP_SECONDS - idle) + 1)
+            focus_status.set(f"⏱ idle stop in {remaining}s")
+            state_label.config(fg="#f59e0b")
+        else:
+            if focus_lock:
+                pass
+            else:
+                focus_status.set(" RECORDING")
+                state_label.config(fg=STOP)
+    root.after(500, idle_stop_poll)
+
+
 # ---------------------------------------------------------------------------
 # Compact dictation widget
 # ---------------------------------------------------------------------------
@@ -1706,6 +1746,7 @@ threading.Thread(target=hotkey_message_thread, daemon=True).start()
 root.after(FOCUS_POLL_MS, update_focus_tracking)
 root.after(30, hotkey_poll)
 root.after(500, _topmost_keepalive)
+root.after(2000, idle_stop_poll)
 root.mainloop()
 
 try:
