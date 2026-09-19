@@ -1041,6 +1041,12 @@ def mic_cb(indata, frames, time_info, status):
         if status:
             L("MIC STATUS: %s", status)
         block = indata[:, 0].copy()
+        # Feed the main START/mic orb with the same live microphone signal.
+        # int16 RMS is normalized to 0..1 for the orb's amplitude mapping.
+        try:
+            _btn_rms[0] = min(1.0, float(np.sqrt(np.mean(block.astype(np.float32) ** 2))) / 32768.0)
+        except Exception:
+            pass
         q.put_nowait(block)
     except queue.Full:
         L("MIC QUEUE FULL  DROPPED AUDIO BLOCK")
@@ -1799,8 +1805,14 @@ def start_record():
         focus_status.set(f"🔒 {locked_app}")
     else:
         focus_status.set(" RECORDING")
-    btn.config(text="  STOP", command=lambda: stop_record("STOP button"), state="normal",
-               bg=STOP, fg="#ffffff", activebackground="#fb7185", activeforeground="#ffffff")
+    btn.unbind("<Button-1>")
+    btn.bind("<Button-1>", lambda e: stop_record("STOP button"))
+    _btn_recording[0] = True
+    _btn_rms[0] = 0.0
+    _btn_orb_level[0] = 0.0
+    _btn_orb_phase[0] = 0.0
+    _btn_draw("recording")
+    root.after(25, _btn_animate)
     mode_live.config(state="disabled")
     mode_buf.config(state="disabled")
     mode_pro.config(state="disabled")
@@ -1836,7 +1848,9 @@ def stop_record(reason="user stop"):
         status.set("FINALIZING  completing Gemini transcription")
     focus_status.set(" STOPPING")
     state_label.config(fg="#f59e0b")
-    btn.config(text="", state="disabled", bg="#27272a", fg="#a1a1aa", activebackground="#27272a", activeforeground="#a1a1aa")
+    _btn_recording[0] = False
+    _btn_draw("disabled")
+    btn.unbind("<Button-1>")
     mode_live.config(state="disabled")
     mode_buf.config(state="disabled")
     mode_pro.config(state="disabled")
@@ -1956,8 +1970,10 @@ def poll_result():
         recording = False
         recording_focus = None
         current_future = None
-        btn.config(text="  START", command=start_record, state="normal",
-                   bg="#f4f4f5", fg="#18181b", activebackground="#ffffff", activeforeground="#09090b")
+        _btn_recording[0] = False
+        _btn_draw("idle")
+        btn.unbind("<Button-1>")
+        btn.bind("<Button-1>", lambda e: start_record())
         mode_live.config(state="normal")
         mode_buf.config(state="normal")
         mode_pro.config(state="normal")
@@ -2333,7 +2349,7 @@ BORDER = "#303036"
 TEXT = "#e4e4e7"
 MUTED = "#8b8b95"
 ACTIVE = "#3f3f46"
-STOP = "#e11d48"
+STOP = "#22c55e"  # recording state color
 
 frame = tk.Frame(root, padx=1, pady=1, bd=1, relief="solid", bg=BORDER)
 frame.pack(fill="both", expand=True)
@@ -2397,13 +2413,81 @@ mode_not = tk.Button(mode_wrap, text="NTS", command=lambda: set_mode("notes"),
 mode_not.grid(row=0, column=3, sticky="nsew", padx=1, pady=1)
 mode_label = mode_live
 
-btn = tk.Button(
-    pill, text="  START", command=start_record,
-    font=("Segoe UI", 8, "bold"), width=9, height=1,
-    relief="flat", bd=0, bg="#f4f4f5", fg="#18181b",
-    activebackground="#ffffff", activeforeground="#09090b", cursor="hand2"
+btn = tk.Canvas(
+    pill, width=32, height=32,
+    bg=BG, highlightthickness=0, bd=0, cursor="hand2"
 )
-btn.grid(row=0, column=2, sticky="w")
+btn.grid(row=0, column=2, sticky="w", padx=(0, 2))
+
+# ── shared orb/mic-icon helpers used by both main btn and notes editor ──────
+_BTN_FONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "MaterialIcons-Regular.ttf")
+
+def _draw_mic_icon(canvas, cx, cy, size=22, color="#18181b"):
+    """Render the Material Icons mic glyph centred on (cx, cy)."""
+    try:
+        from PIL import Image as _I, ImageDraw as _ID, ImageFont as _IF, ImageTk as _ITk
+        fnt = _IF.truetype(_BTN_FONT_PATH, size)
+        img = _I.new("RGBA", (int(size*1.6), int(size*1.6)), (0, 0, 0, 0))
+        _ID.Draw(img).text((img.width//2, img.height//2), "\ue029",
+                           font=fnt, fill=color, anchor="mm")
+        ph = _ITk.PhotoImage(img)
+        canvas._mic_icon_ph = ph
+        canvas.create_image(cx, cy, image=ph)
+    except Exception:
+        canvas.create_text(cx, cy, text="REC", font=(_UI_FONT or "Segoe UI", 8, "bold"), fill=color)
+
+_btn_orb_level = [0.0]
+_btn_orb_phase = [0.0]
+_btn_recording = [False]   # mirrors global `recording` for canvas animation
+_btn_rms       = [0.0]
+
+def _btn_draw(state="idle"):
+    """Redraw the main START/STOP canvas button."""
+    btn.delete("all")
+    W = int(btn.cget("width"))
+    H = int(btn.cget("height"))
+    cx, cy = W // 2, H // 2
+
+    if state == "idle":
+        btn.configure(bg=BG)
+        # White mic on the dark pill; no colored button background.
+        _draw_mic_icon(btn, cx, cy, size=22, color="#ffffff")
+
+    elif state == "recording":
+        btn.configure(bg=BG)
+        rms = _btn_rms[0]
+        target = max(0.0, min(1.0, (max(rms, 0.0) / 0.045) ** 0.55))
+        prev = _btn_orb_level[0]
+        _btn_orb_level[0] = prev + (target - prev) * (0.62 if target > prev else 0.30)
+        level = _btn_orb_level[0]
+        _btn_orb_phase[0] += 0.34
+        breathe = (np.sin(_btn_orb_phase[0]) + 1.0) * 0.035
+        visual = max(0.0, min(1.0, level + breathe))
+
+        # Clean microphone activity bars directly on the dark pill.
+        # No amber circle, fill, glow, or surrounding background.
+        bar_count, bar_w, spacing = 5, 2, 4
+        total_w = bar_count * bar_w + (bar_count - 1) * spacing
+        x0 = cx - total_w / 2
+        bar_scale = 2.0 + visual * 7.5
+        for bi in range(bar_count):
+            wave = 0.55 + 0.45 * np.sin(_btn_orb_phase[0] * 1.8 + bi * 1.15)
+            bh = max(2.0, bar_scale * wave)
+            bx = x0 + bi * (bar_w + spacing)
+            btn.create_rectangle(bx, cy-bh, bx+bar_w, cy+bh,
+                                 fill="#22c55e", outline="")
+
+    elif state == "disabled":
+        btn.configure(bg=BG)
+        _draw_mic_icon(btn, cx, cy, size=22, color="#71717a")
+
+def _btn_animate():
+    if _btn_recording[0]:
+        _btn_draw("recording")
+        root.after(25, _btn_animate)   # 40 fps
+
+_btn_draw("idle")
+btn.bind("<Button-1>", lambda e: start_record() if not recording else stop_record("STOP button"))
 
 lock_btn = tk.Button(
     pill, text="🔓", command=toggle_focus_lock, width=2, height=1,
@@ -3015,7 +3099,7 @@ def _notes_open_editor(note=None):
         _notes_canvas.bind_all("<MouseWheel>", _notes_mousewheel)
         dlg.destroy()
 
-    dlg.protocol("WM_DELETE_WINDOW", _on_close)
+    dlg.protocol("WM_DELETE_WINDOW", lambda: None)  # overridden after mic setup below
 
     # Amber header bar
     hdr = tk.Frame(_dlg_outer, bg=_N["accent"], padx=8, pady=6)
@@ -3052,10 +3136,170 @@ def _notes_open_editor(note=None):
     close_lbl.pack(side="right", padx=(6, 0))
     close_lbl.bind("<Button-1>", lambda e: _on_close())
 
+    # Drag — bind on header and all children except interactive ones
     def _hdr_ds(e): dlg._dx = e.x_root - dlg.winfo_x(); dlg._dy = e.y_root - dlg.winfo_y()
     def _hdr_dm(e): dlg.geometry(f"+{e.x_root - dlg._dx}+{e.y_root - dlg._dy}")
-    hdr.bind("<Button-1>", _hdr_ds)
-    hdr.bind("<B1-Motion>", _hdr_dm)
+    hdr.bind("<Button-1>",  _hdr_ds, "+")
+    hdr.bind("<B1-Motion>", _hdr_dm, "+")
+
+    # --- Mic / orb button ---
+    _ORB_W, _ORB_H = 32, 32
+    _mic_active   = [False]
+    _mic_stream   = [None]
+    _mic_future   = [None]
+    _mic_stop_evt = [None]
+    _mic_rms      = [0.0]   # live RMS updated from audio thread
+    _orb_level    = [0.0]   # smoothed visual level; kept separate from raw audio
+    _orb_phase    = [0.0]
+
+    orb_cv = tk.Canvas(hdr, width=_ORB_W, height=_ORB_H,
+                       bg=_N["accent"], highlightthickness=0, cursor="hand2")
+    orb_cv.pack(side="right", padx=(0, 4))
+
+    def _orb_draw(rms=0.0):
+        orb_cv.delete("all")
+        cx, cy = _ORB_W // 2, _ORB_H // 2
+
+        if not _mic_active[0]:
+            _draw_mic_icon(orb_cv, cx, cy, size=22, color="#0a0a0a")
+            return
+
+        # RMS from PortAudio is usually a small float (often 0.005–0.20).
+        # Use a sensitive nonlinear mapping so normal speech produces visible motion.
+        target = max(0.0, min(1.0, (max(rms, 0.0) / 0.045) ** 0.55))
+        prev = _orb_level[0]
+        # Fast attack, slightly slower release: responsive without jitter.
+        _orb_level[0] = prev + (target - prev) * (0.62 if target > prev else 0.30)
+        level = _orb_level[0]
+        _orb_phase[0] += 0.34
+
+        # Small idle breathing + strong voice-reactive expansion.
+        breathe = (np.sin(_orb_phase[0]) + 1.0) * 0.035
+        visual = max(0.0, min(1.0, level + breathe))
+
+        r = 8.0 + visual * 7.0
+        glow = r + 2.5 + visual * 2.0
+
+        orb_cv.create_oval(cx-glow, cy-glow, cx+glow, cy+glow,
+                           outline="#f59e0b", width=1)
+        orb_cv.create_oval(cx-r, cy-r, cx+r, cy+r,
+                           fill="#f59e0b", outline="")
+
+        # Deterministic waveform bars: no random generation or NumPy RNG per frame.
+        bar_count, bar_w, spacing = 5, 2, 4
+        total_w = bar_count * bar_w + (bar_count - 1) * spacing
+        x0 = cx - total_w / 2
+        bar_scale = 2.0 + visual * 7.5
+        for bi in range(bar_count):
+            wave = 0.55 + 0.45 * np.sin(_orb_phase[0] * 1.8 + bi * 1.15)
+            bh = max(2.0, bar_scale * wave)
+            bx = x0 + bi * (bar_w + spacing)
+            orb_cv.create_rectangle(bx, cy-bh, bx+bar_w, cy+bh,
+                                    fill="#0a0a0a", outline="")
+
+    _orb_draw()
+
+    def _orb_animate():
+        if _mic_active[0]:
+            _orb_draw(_mic_rms[0])
+            dlg.after(25, _orb_animate)   # 40 fps: noticeably more responsive
+
+    def _mic_toggle(e=None):
+        if _mic_active[0]:
+            _mic_stop()
+        else:
+            _mic_start()
+
+    def _mic_start():
+        if _mic_active[0]:
+            return
+        _mic_active[0] = True
+        _mic_stop_evt[0] = threading.Event()
+        stop_evt = _mic_stop_evt[0]
+
+        # Run Gemini live transcription in the existing async loop,
+        # output appended directly into t_body
+        async def _transcribe_to_note():
+            try:
+                client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
+                cfg = types.LiveConnectConfig(
+                    response_modalities=["TEXT"],
+                    input_audio_transcription=types.AudioTranscriptionConfig(language_codes=[]),
+                )
+                async with client.aio.live.connect(model=MODEL, config=cfg) as session:
+                    audio_q: asyncio.Queue = asyncio.Queue()
+
+                    def _audio_cb(indata, frames, t_info, status):
+                        chunk = indata[:, 0].copy()
+                        rms = float(np.sqrt(np.mean(chunk ** 2)))
+                        _mic_rms[0] = rms
+                        pcm16 = (resample_poly(chunk, RATE_OUT, RATE_IN) * 32767).astype(np.int16)
+                        audio_q.put_nowait(pcm16.tobytes())
+
+                    stream = sd.InputStream(samplerate=RATE_IN, channels=1,
+                                            dtype="float32", blocksize=BLOCK,
+                                            device=DEVICE, callback=_audio_cb)
+
+                    async def _sender():
+                        with stream:
+                            while not stop_evt.is_set():
+                                try:
+                                    chunk = await asyncio.wait_for(audio_q.get(), 0.1)
+                                    await session.send_realtime_input(
+                                        audio=types.Blob(data=chunk, mime_type="audio/pcm;rate=16000")
+                                    )
+                                except asyncio.TimeoutError:
+                                    pass
+
+                    async def _receiver():
+                        async for response in session.receive():
+                            if stop_evt.is_set():
+                                break
+                            sc = getattr(response, "server_content", None)
+                            if sc is None:
+                                continue
+                            inp = getattr(sc, "input_transcription", None)
+                            txt = getattr(inp, "text", None) if inp is not None else None
+                            if txt:
+                                def _append(t=txt):
+                                    cur = t_body.get("1.0", "end-1c")
+                                    if cur in ("", "Take a note…"):
+                                        t_body.delete("1.0", "end")
+                                        t_body.config(fg=_N["text_main"])
+                                        t_body.insert("1.0", t)
+                                    else:
+                                        if not cur.endswith(" "):
+                                            t_body.insert("end", " ")
+                                        t_body.insert("end", t)
+                                    t_body.see("end")
+                                root.after(0, _append)
+
+                    await asyncio.gather(_sender(), _receiver())
+            except Exception as ex:
+                L("NOTES MIC ERROR: %s", ex)
+
+        _mic_future[0] = asyncio.run_coroutine_threadsafe(_transcribe_to_note(), loop)
+        dlg.after(50, _orb_animate)
+
+    def _mic_stop():
+        if not _mic_active[0]:
+            return
+        _mic_active[0] = False
+        _mic_rms[0] = 0.0
+        if _mic_stop_evt[0]:
+            _mic_stop_evt[0].set()
+        if _mic_future[0] and not _mic_future[0].done():
+            _mic_future[0].cancel()
+        _orb_draw(0.0)
+
+    orb_cv.bind("<Button-1>", _mic_toggle)
+
+    # Stop mic if dialog closes mid-recording
+    _orig_on_close = _on_close
+    def _on_close():
+        _mic_stop()
+        _orig_on_close()
+    dlg.protocol("WM_DELETE_WINDOW", _on_close)
 
     t_body = tk.Text(_dlg_outer, bg=_N["card_bg"], fg=_N["text_main"],
                      insertbackground=_N["text_dim"],
