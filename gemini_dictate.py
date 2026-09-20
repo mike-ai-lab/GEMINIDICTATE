@@ -2081,12 +2081,15 @@ def _update_history_nav():
 
 
 def toggle_conv_panel(show):
-    """Expand/collapse the CONV panel."""
+    """Show/hide the CONV orb row (attached to main widget) and caption Toplevel."""
     if show:
         prompt_panel.pack_forget()
         notes_panel.pack_forget()
-        conv_panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))
-        _notes_canvas.unbind_all("<MouseWheel>")
+        try:
+            conv_panel.pack(fill="x", padx=4, pady=(0, 4))
+        except Exception:
+            pass
+        _conv_caps_show()
     else:
         if _conv_is_connected:
             stop_conv()
@@ -2094,6 +2097,7 @@ def toggle_conv_panel(show):
             conv_panel.pack_forget()
         except Exception:
             pass
+        _conv_caps_hide()
 
 
 def toggle_prompt_panel(show):
@@ -2464,7 +2468,7 @@ def set_mode(new_mode):
     # Set geometry FIRST — before panels pack, to avoid the resize glitch
     x, y = root.winfo_x(), root.winfo_y()
     if is_prompt or is_notes or is_conv:
-        root.geometry(f"500x500+{x}+{y}")
+        root.geometry(f"500x120+{x}+{y}" if is_conv else f"500x500+{x}+{y}")
     else:
         root.geometry(f"500x54+{x}+{y}")
 
@@ -2478,7 +2482,7 @@ def set_mode(new_mode):
     else:
         btn.grid()
 
-    # Hide lock button on PRO, NTS, CONV
+    # Hide lock button on PRO, NTS and CONV
     if is_prompt or is_notes or is_conv:
         lock_btn.grid_remove()
     else:
@@ -2527,6 +2531,7 @@ def open_widget():
     root.lift()
     root.attributes("-topmost", True)
     _assert_topmost()
+    root.after(30, _apply_rounded_corners)
     L("F8 WIDGET OPENED  target intentionally NOT captured")
 
 
@@ -2535,6 +2540,7 @@ def close_widget():
         stop_record("widget closed")
     if _conv_is_connected:
         stop_conv()
+    _conv_caps_hide()
     root.withdraw()
     root.attributes("-topmost", False)
     reset_widget_state()
@@ -2797,15 +2803,38 @@ def make_widget_no_activate():
         user32.SetWindowLongW(hwnd, GWL_EXSTYLE, exstyle | WS_EX_NOACTIVATE)
         root.update_idletasks()
         user32.SetWindowPos(hwnd, 0, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | 0x0020 | 0x0040)
-        # Tk draws the fixed pill itself. Do not apply a Windows region here:
-        # the root is still withdrawn at startup and its measured size can be
-        # 1x1, which would clip the entire widget.
         root.update()
         L("WIDGET WS_EX_NOACTIVATE + BORDERLESS PILL APPLIED hwnd=%s", hex(hwnd))
     except Exception:
         L("WIDGET NO-ACTIVATE ERROR\n%s", traceback.format_exc())
 
 root.after_idle(make_widget_no_activate)
+
+
+def _apply_rounded_corners(r=12):
+    """Clip the main window to a rounded rectangle using a Win32 region."""
+    try:
+        hwnd = int(user32.GetAncestor(int(root.winfo_id()), GA_ROOT))
+        w    = root.winfo_width()
+        h    = root.winfo_height()
+        if w <= 1 or h <= 1:
+            return
+        d    = r * 2
+        rgn  = gdi32.CreateRoundRectRgn(0, 0, w + 1, h + 1, d, d)
+        user32.SetWindowRgn(hwnd, rgn, True)
+    except Exception:
+        pass
+
+
+_rounded_corners_job = [None]
+
+def _reapply_rounded_corners(e=None):
+    if _rounded_corners_job[0]:
+        root.after_cancel(_rounded_corners_job[0])
+    _rounded_corners_job[0] = root.after(80, _apply_rounded_corners)
+
+
+root.bind("<Configure>", _reapply_rounded_corners)
 
 status = tk.StringVar(value="READY")
 focus_status = tk.StringVar(value=" CLICK TEXT FIELD")
@@ -2868,31 +2897,47 @@ mode_wrap.grid_columnconfigure(1, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(2, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(3, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(4, weight=1, uniform="mode")
+
+# Draw rounded rect background on mode_wrap using a Canvas overlay
+_mw_canvas = tk.Canvas(mode_wrap, bg=BG, highlightthickness=0, bd=0)
+_mw_canvas.place(x=0, y=0, relwidth=1, relheight=1)
+
+def _draw_mode_wrap_bg(e=None):
+    c = _mw_canvas
+    c.delete("all")
+    w = c.winfo_width() or 200
+    h = c.winfo_height() or 34
+    r = 8
+    pts = [r,0, w-r,0, w,0, w,r, w,h-r, w,h, w-r,h, r,h, 0,h, 0,h-r, 0,r, 0,0]
+    c.create_polygon(pts, smooth=True, fill="#1a1a1f", outline="#2d2d3a", width=1)
+
+_mw_canvas.bind("<Configure>", _draw_mode_wrap_bg)
+mode_wrap.bind("<Configure>", _draw_mode_wrap_bg)
 mode_live = tk.Button(mode_wrap, text="LIVE", command=lambda: set_mode("live"),
     font=(_UI_FONT or "Segoe UI", 8, "bold"), fg="#f4f4f5", bg="#2d2d35",
     activebackground="#52525b", activeforeground="white", relief="flat", bd=0,
     cursor="hand2")
-mode_live.grid(row=0, column=0, sticky="nsew", padx=1, pady=1)
+mode_live.grid(row=0, column=0, sticky="nsew", padx=2, pady=2)
 mode_buf = tk.Button(mode_wrap, text="BUF", command=lambda: set_mode("buffered"),
     font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
     activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
     cursor="hand2")
-mode_buf.grid(row=0, column=1, sticky="nsew", padx=1, pady=1)
+mode_buf.grid(row=0, column=1, sticky="nsew", padx=2, pady=2)
 mode_pro = tk.Button(mode_wrap, text="PRO", command=lambda: set_mode("prompt"),
     font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
     activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
     cursor="hand2")
-mode_pro.grid(row=0, column=2, sticky="nsew", padx=1, pady=1)
+mode_pro.grid(row=0, column=2, sticky="nsew", padx=2, pady=2)
 mode_not = tk.Button(mode_wrap, text="NTS", command=lambda: set_mode("notes"),
     font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
     activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
     cursor="hand2")
-mode_not.grid(row=0, column=3, sticky="nsew", padx=1, pady=1)
+mode_not.grid(row=0, column=3, sticky="nsew", padx=2, pady=2)
 mode_conv = tk.Button(mode_wrap, text="CONV", command=lambda: set_mode("conv"),
     font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
     activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
     cursor="hand2")
-mode_conv.grid(row=0, column=4, sticky="nsew", padx=1, pady=1)
+mode_conv.grid(row=0, column=4, sticky="nsew", padx=2, pady=2)
 mode_label = mode_live
 
 btn = tk.Canvas(
@@ -3003,22 +3048,22 @@ close_btn.grid(row=0, column=4, sticky="e", padx=(3, 6))
 # Color palette matching the React reference design
 _P = {
     "panel_bg":      "#0d0d12",   # main panel bg
-    "input_bg":      "#0c0c10",   # raw speech box bg
-    "input_border":  "#1e1e2a",   # box border (white/10 equivalent)
-    "input_border_h":"#2e2e3e",   # focused border
-    "output_bg":     "#08080c",   # rewritten prompt box bg
-    "output_border": "#1a1a24",   # output box border
-    "accent":        "#10b981",   # emerald-500 — used for text & top bar only
-    "accent_dim":    "#065f46",   # emerald-900 — very subtle
-    "accent_text":   "#34d399",   # emerald-400 — readable on dark
-    "accent_badge":  "#064e3b",   # badge bg
-    "muted":         "#475569",   # slate-600
-    "muted2":        "#334155",   # slate-700
-    "text_main":     "#cbd5e1",   # slate-300
-    "text_dim":      "#64748b",   # slate-500
-    "btn_rewrite_bg":"#10b981",   # rewrite button bg
-    "btn_clear_bg":  "#1e1e2a",   # clear button bg
-    "divider":       "#1e1e2a",   # divider line
+    "input_bg":      "#1a1a24",   # raw speech box bg — lighter than panel
+    "input_border":  "#2a2a3a",
+    "input_border_h":"#3a3a4e",
+    "output_bg":     "#161620",   # output box bg — slightly lighter than panel
+    "output_border": "#252535",
+    "accent":        "#10b981",
+    "accent_dim":    "#065f46",
+    "accent_text":   "#34d399",
+    "accent_badge":  "#064e3b",
+    "muted":         "#475569",
+    "muted2":        "#334155",
+    "text_main":     "#cbd5e1",
+    "text_dim":      "#64748b",
+    "btn_rewrite_bg":"#10b981",
+    "btn_clear_bg":  "#1e1e2a",
+    "divider":       "#1e1e2a",
     "mono_font":     "Consolas",
 }
 
@@ -3043,12 +3088,40 @@ tk.Label(input_header, text="speak → stop → rewrite",
          font=(_UI_FONT or "Segoe UI", 7),
          fg=_P["muted2"], bg=_P["panel_bg"], anchor="e").pack(side="right")
 
+# ---------------------------------------------------------------------------
+# Rounded-border wrapper for Text widgets in the PRO panel
+# ---------------------------------------------------------------------------
+def _rounded_box(parent, r=10, fill="#1e1e2a", outline="#2e2e3e"):
+    """Frame with a Canvas drawn smooth rounded-rect border.
+    Uses pack geometry so height is driven by the child widget."""
+    outer = tk.Frame(parent, bg=_P["panel_bg"])
+    # Canvas sits behind as a border; child packs on top
+    _c = tk.Canvas(outer, bg=_P["panel_bg"], highlightthickness=0, bd=0)
+    _c.place(x=0, y=0, relwidth=1, relheight=1)
+    inner = tk.Frame(outer, bg=fill)
+    inner.pack(fill="both", expand=True, padx=r//2, pady=r//2)
+
+    def _redraw(e=None):
+        _c.delete("all")
+        w = outer.winfo_width()
+        h = outer.winfo_height()
+        if w < 4 or h < 4:
+            return
+        pts = [r,0, w-r,0, w,0, w,r, w,h-r, w,h, w-r,h, r,h, 0,h, 0,h-r, 0,r, 0,0]
+        _c.create_polygon(pts, smooth=True, fill=fill, outline=outline, width=1)
+
+    outer.bind("<Configure>", _redraw)
+    return outer, inner
+
 # Input box
-input_border = tk.Frame(_panel_inner, bg=_P["input_border"], bd=0)
-input_border.pack(fill="x", pady=(0, 4))
+_input_outer, _input_inner = _rounded_box(
+    _panel_inner, r=8,
+    fill=_P["input_bg"], outline=_P["input_border"]
+)
+_input_outer.pack(fill="x", pady=(0, 4))
 
 prompt_textbox = tk.Text(
-    input_border, height=4, wrap="word",
+    _input_inner, height=4, wrap="word",
     font=(_UI_FONT or "Segoe UI", 9),
     fg=_P["text_main"], bg=_P["input_bg"],
     insertbackground=_P["muted"],
@@ -3057,7 +3130,8 @@ prompt_textbox = tk.Text(
     spacing1=2, spacing3=1,
     selectbackground="#1e3a5f", selectforeground="#e2e8f0",
 )
-prompt_textbox.pack(fill="both", padx=1, pady=1)
+prompt_textbox.pack(fill="both", expand=True)
+input_border = _input_outer
 _configure_md_tags_input(prompt_textbox)
 
 # Char count footer
@@ -3202,42 +3276,107 @@ def _make_tooltip(widget, text):
 toolbar = tk.Frame(_panel_inner, bg=_P["panel_bg"])
 toolbar.pack(fill="x", pady=(0, 6))
 
-# Transparent button base — no bg box, hover shows subtle grey
 _HOVER_BG = "#2a2a35"
 
 def _icon_btn(parent, text, cmd, tooltip_text, fg="#d4d4d8",
-              bold=False, disabled=False, green=False):
-    """Create a flat icon button with hover-only background."""
-    f = (_UI_FONT or "Segoe UI", 11, "bold") if bold else (_UI_FONT or "Segoe UI", 11)
-    bg_normal = _P["btn_rewrite_bg"] if green else _P["panel_bg"]
-    fg_normal = "#0a0a0a" if green else fg
+              bold=False, disabled=False, green=False, mat_icon=None, icon_size=16):
+    """Flat icon button. If mat_icon codepoint given, renders it via MaterialIcons."""
+    f = (_UI_FONT or "Segoe UI", 10, "bold") if bold else (_UI_FONT or "Segoe UI", 11)
+    if green:
+        b = tk.Button(parent, text=text, command=cmd,
+                      font=f, fg="#0a0a0a", bg=_P["btn_rewrite_bg"],
+                      activebackground="#34d399", activeforeground="#0a0a0a",
+                      relief="flat", bd=0, cursor="hand2",
+                      padx=14, pady=4,
+                      state="disabled" if disabled else "normal")
+        _make_tooltip(b, tooltip_text)
+        return b
+
+    # Try to render Material Icon glyph via PIL
+    if mat_icon:
+        try:
+            from PIL import Image as _PI, ImageDraw as _PD, ImageFont as _PF, ImageTk as _PT
+            _sz = icon_size
+            _fnt = _PF.truetype(_BTN_FONT_PATH, _sz)
+            _img = _PI.new("RGBA", (_sz + 8, _sz + 8), (0, 0, 0, 0))
+            _ic = "#2a5a45" if disabled else fg
+            _PD.Draw(_img).text((_img.width//2, _img.height//2), mat_icon,
+                                font=_fnt, fill=_ic, anchor="mm")
+            _ph = _PT.PhotoImage(_img)
+            b = tk.Label(parent, image=_ph, bg=_P["panel_bg"],
+                         cursor="arrow" if disabled else "hand2",
+                         padx=4, pady=2)
+            b._mat_ph = _ph  # keep ref
+            b._mat_icon = mat_icon
+            b._mat_sz = _sz
+            b._mat_fg = fg
+            b._mat_disabled = [disabled]
+
+            def _refresh_icon(color):
+                try:
+                    _img2 = _PI.new("RGBA", (_sz + 8, _sz + 8), (0, 0, 0, 0))
+                    _PD.Draw(_img2).text((_img2.width//2, _img2.height//2), mat_icon,
+                                        font=_fnt, fill=color, anchor="mm")
+                    ph2 = _PT.PhotoImage(_img2)
+                    b._mat_ph = ph2
+                    b.config(image=ph2)
+                except Exception:
+                    pass
+
+            if not disabled:
+                b.bind("<Enter>",    lambda e: _refresh_icon("#ffffff"))
+                b.bind("<Leave>",    lambda e: _refresh_icon(fg))
+                b.bind("<Button-1>", lambda e: cmd() if not b._mat_disabled[0] else None)
+
+            orig_config = b.config
+            def _patched_config(**kw):
+                if "state" in kw:
+                    st = kw.pop("state")
+                    b._mat_disabled[0] = (st == "disabled")
+                    _refresh_icon("#2a5a45" if b._mat_disabled[0] else fg)
+                    b.config(cursor="arrow" if b._mat_disabled[0] else "hand2")
+                if kw:
+                    orig_config(**kw)
+            b.config = _patched_config
+
+            _make_tooltip(b, tooltip_text)
+            return b
+        except Exception:
+            pass  # fall through to text button
+
     b = tk.Button(parent, text=text, command=cmd,
-                  font=f, fg=fg_normal, bg=bg_normal,
-                  activebackground="#34d399" if green else _HOVER_BG,
-                  activeforeground="#0a0a0a" if green else "#ffffff",
+                  font=f, fg=fg, bg=_P["panel_bg"],
+                  activebackground=_HOVER_BG, activeforeground="#ffffff",
                   relief="flat", bd=0, cursor="hand2",
                   padx=6, pady=3,
                   state="disabled" if disabled else "normal")
-    if not green:
-        b.bind("<Enter>", lambda e: b.config(bg=_HOVER_BG) if str(b.cget("state")) != "disabled" else None)
-        b.bind("<Leave>", lambda e: b.config(bg=_P["panel_bg"]))
+    b.bind("<Enter>", lambda e: b.config(bg=_HOVER_BG) if str(b.cget("state")) != "disabled" else None)
+    b.bind("<Leave>", lambda e: b.config(bg=_P["panel_bg"]))
     _make_tooltip(b, tooltip_text)
     return b
 
+# Material Icons codepoints
+_MI_NEW   = "\ue145"   # add_circle_outline
+_MI_UNDO  = "\ue166"   # undo
+_MI_CLEAR = "\ue872"   # delete
+
 # Action buttons (left side)
-prompt_submit_btn = _icon_btn(toolbar, "✦", submit_prompt, "Rewrite Prompt", bold=True, green=True)
+prompt_submit_btn = _icon_btn(toolbar, "✦  Rewrite", submit_prompt, "Rewrite Prompt", bold=True, green=True)
 prompt_submit_btn.pack(side="left")
 
-_new_btn = _icon_btn(toolbar, "⊕", new_prompt, "New — clear both fields")
-_new_btn.pack(side="left", padx=(2, 0))
+_new_btn = _icon_btn(toolbar, "\ue145", new_prompt, "New — clear both fields",
+                     mat_icon=_MI_NEW, icon_size=18)
+_new_btn.pack(side="left", padx=(4, 0))
 
-undo_btn = _icon_btn(toolbar, "↩", undo_prompt, "Undo — restore last output", disabled=True)
+undo_btn = _icon_btn(toolbar, "\ue166", undo_prompt, "Undo — restore last output",
+                     disabled=True, mat_icon=_MI_UNDO, icon_size=18)
 undo_btn.pack(side="left", padx=(2, 0))
 
-_clr_btn = _icon_btn(toolbar, "✕", clear_prompt, "Clear output")
+_clr_btn = _icon_btn(toolbar, "\ue872", clear_prompt, "Clear output",
+                     mat_icon=_MI_CLEAR, icon_size=18)
 _clr_btn.pack(side="left", padx=(2, 0))
 
-# Status label — flexible, truncates rather than overflows
+# Status label
 _status_frame = tk.Frame(toolbar, bg=_P["panel_bg"])
 _status_frame.pack(side="left", fill="x", expand=True, padx=(8, 4))
 _status_lbl = tk.Label(_status_frame, textvariable=prompt_status,
@@ -3255,7 +3394,6 @@ def _update_status_wrap(event=None):
         pass
 _status_frame.bind("<Configure>", _update_status_wrap)
 
-# History navigation: [3/10] ← →   (left-to-right, packed left from right anchor)
 hist_count_label = tk.Label(toolbar, text="",
                             font=(_P["mono_font"], 7),
                             fg=_P["muted"], bg=_P["panel_bg"],
@@ -3273,24 +3411,50 @@ tk.Frame(_panel_inner, bg=_P["divider"], height=1).pack(fill="x", pady=(0, 6))
 
 # --- Output section header ---
 output_header = tk.Frame(_panel_inner, bg=_P["panel_bg"])
-output_header.pack(fill="x", pady=(0, 4))
+output_header.pack(fill="x", pady=(0, 6))
 
-_badge = tk.Frame(output_header, bg=_P["accent_badge"], padx=6, pady=2)
-_badge.pack(side="left")
-tk.Label(_badge, text="AI REWRITTEN PROMPT",
-         font=(_P["mono_font"], 7, "bold"),
-         fg=_P["accent_text"], bg=_P["accent_badge"]).pack()
+# "AI REWRITTEN PROMPT" badge — rounded pill via Canvas
+_badge_c = tk.Canvas(output_header, height=22, bg=_P["panel_bg"],
+                     highlightthickness=0, bd=0)
+_badge_c.pack(side="left")
+
+def _draw_badge(e=None):
+    _badge_c.delete("all")
+    lbl = "AI REWRITTEN PROMPT"
+    # measure text width
+    _badge_c.update_idletasks()
+    tmp = _badge_c.create_text(-999, -999, text=lbl,
+                               font=(_P["mono_font"], 7, "bold"))
+    bb = _badge_c.bbox(tmp); _badge_c.delete(tmp)
+    tw = (bb[2] - bb[0]) if bb else 120
+    pw = tw + 20  # padding
+    _badge_c.config(width=pw)
+    h = 22
+    r = 5
+    pts = [r,0, pw-r,0, pw,0, pw,r, pw,h-r, pw,h, pw-r,h, r,h, 0,h, 0,h-r, 0,r, 0,0]
+    _badge_c.create_polygon(pts, smooth=True,
+                            fill=_P["accent_badge"], outline="")
+    _badge_c.create_text(pw//2, h//2, text=lbl,
+                         font=(_P["mono_font"], 7, "bold"),
+                         fill=_P["accent_text"], anchor="center")
+
+_badge_c.bind("<Configure>", _draw_badge)
+_badge_c.after(10, _draw_badge)
 
 tk.Label(output_header, text="✓ auto-copied",
          font=(_UI_FONT or "Segoe UI", 7),
          fg=_P["accent_dim"], bg=_P["panel_bg"], anchor="e").pack(side="right")
 
-# Output box
-result_border = tk.Frame(_panel_inner, bg=_P["output_border"], bd=0)
-result_border.pack(fill="both", expand=True)
+# Output box — rounded border
+_result_outer, _result_inner = _rounded_box(
+    _panel_inner, r=8,
+    fill=_P["output_bg"], outline=_P["output_border"]
+)
+_result_outer.pack(fill="both", expand=True)
+result_border = _result_outer
 
 prompt_result_box = tk.Text(
-    result_border, wrap="word",
+    _result_inner, wrap="word",
     font=(_UI_FONT or "Segoe UI", 9),
     fg=_P["text_main"], bg=_P["output_bg"],
     insertbackground=_P["accent_text"],
@@ -3300,7 +3464,7 @@ prompt_result_box = tk.Text(
     selectbackground="#1e3a5f", selectforeground="#e2e8f0",
     cursor="xterm",
 )
-prompt_result_box.pack(fill="both", expand=True, padx=1, pady=1)
+prompt_result_box.pack(fill="both", expand=True)
 _configure_md_tags_result(prompt_result_box)
 _make_context_menu(prompt_result_box)
 
@@ -3313,6 +3477,9 @@ def drag_start(event):
 
 def drag_move(event):
     root.geometry(f"+{event.x_root - root._drag_x}+{event.y_root - root._drag_y}")
+    # Keep caption window anchored below widget while dragging
+    try: _conv_caps_reposition()
+    except Exception: pass
 
 for w in (frame, pill):
     w.bind("<Button-1>", drag_start)
@@ -3508,11 +3675,31 @@ def _notes_render_list():
 def _notes_make_card(parent, note):
     is_pinned = bool(note.get("pinned"))
     stripe_color = _N["accent"] if not is_pinned else "#22c55e"
-    stripe = tk.Frame(parent, bg=stripe_color, height=2)
-    stripe.pack(fill="x", pady=(6, 0))
 
-    card = tk.Frame(parent, bg=_N["card_bg"], padx=10, pady=8)
-    card.pack(fill="x", pady=(0, 2))
+    # Rounded card container drawn via Canvas polygon
+    card_outer = tk.Frame(parent, bg=_N["panel_bg"])
+    card_outer.pack(fill="x", pady=(6, 2))
+
+    _cc = tk.Canvas(card_outer, bg=_N["panel_bg"], highlightthickness=0, bd=0)
+    _cc.place(x=0, y=0, relwidth=1, relheight=1)
+
+    card = tk.Frame(card_outer, bg=_N["card_bg"], padx=10, pady=8)
+    card.pack(fill="x", padx=2, pady=2)
+
+    def _draw_card_border(e=None):
+        _cc.delete("all")
+        w = card_outer.winfo_width()
+        h = card_outer.winfo_height()
+        if w < 4 or h < 4:
+            return
+        r = 8
+        pts = [r,0, w-r,0, w,0, w,r, w,h-r, w,h, w-r,h, r,h, 0,h, 0,h-r, 0,r, 0,0]
+        _cc.create_polygon(pts, smooth=True,
+                           fill=_N["card_bg"], outline=_N["card_border"], width=1)
+        # accent stripe at top
+        _cc.create_line(r, 1, w-r, 1, fill=stripe_color, width=2)
+
+    card_outer.bind("<Configure>", _draw_card_border)
 
     ch = tk.Frame(card, bg=_N["card_bg"])
     ch.pack(fill="x")
@@ -3556,7 +3743,7 @@ def _notes_make_card(parent, note):
                         justify="left", anchor="w", wraplength=400)
     text_lbl.pack(fill="x", pady=(2, 0))
 
-    for w in (card, title_lbl, text_lbl):
+    for w in (card, card_outer, title_lbl, text_lbl):
         w.bind("<Double-Button-1>", lambda e, n=note: _notes_open_editor(n))
 
 
@@ -3590,6 +3777,26 @@ def _notes_open_editor(note=None):
     rx, ry = root.winfo_x(), root.winfo_y()
     rw, rh = root.winfo_width(), root.winfo_height()
     dlg.geometry(f"400x320+{rx + (rw - 400)//2}+{ry + (rh - 320)//2}")
+
+    def _apply_dlg_rounded(r=12):
+        try:
+            hwnd = int(user32.GetAncestor(int(dlg.winfo_id()), GA_ROOT))
+            w = dlg.winfo_width(); h = dlg.winfo_height()
+            if w > 1 and h > 1:
+                rgn = gdi32.CreateRoundRectRgn(0, 0, w+1, h+1, r*2, r*2)
+                user32.SetWindowRgn(hwnd, rgn, True)
+        except Exception:
+            pass
+
+    _dlg_rnd_job = [None]
+    def _schedule_dlg_rounded(e=None):
+        if _dlg_rnd_job[0]:
+            try: dlg.after_cancel(_dlg_rnd_job[0])
+            except Exception: pass
+        _dlg_rnd_job[0] = dlg.after(80, _apply_dlg_rounded)
+
+    dlg.after(40, _apply_dlg_rounded)
+    dlg.bind("<Configure>", _schedule_dlg_rounded)
 
     # 1px border wrapper
     _dlg_outer = tk.Frame(dlg, bg=BORDER, padx=1, pady=1)
@@ -4385,102 +4592,226 @@ import struct as _struct
 
 # Palette for CONV
 _CV = {
-    "panel_bg":   "#0a0a10",
+    "panel_bg":   "#1a1a22",
+    "orb_row_bg": "#1a1a22",
     "accent":     "#818cf8",
-    "accent_text":"#a5b4fc",
     "muted":      "#475569",
-    "you_fg":     "#e2e8f0",
-    "gem_fg":     "#a5b4fc",
-    "bubble_you": "#1e1b4b",
-    "bubble_gem": "#0f0f1a",
-    "orb_user":   "#818cf8",
-    "orb_ai":     "#34d399",
-    "stop_fg":    "#f87171",
-    "stop_bg":    "#1c0a0a",
-    "status_fg":  "#64748b",
+    "you_fg":     "#F3F4F6",
+    "gem_fg":     "#F3F4F6",
+    "cap_pill_bg":"#12131C",
+    "cap_border": "#2B2D3E",
+    "orb_user":   "#EF4444",
+    "orb_ai":     "#8B5CF6",
+    "transp_key": "#010101",
 }
 
-conv_panel = tk.Frame(frame, bg=_CV["panel_bg"])
-tk.Frame(conv_panel, bg=_CV["accent"], height=2).pack(fill="x")
+# ---------------------------------------------------------------------------
+# CONV panel — orb row packed inside the main widget (frame)
+# ---------------------------------------------------------------------------
+_conv_cap_rows  = []
+_MAX_CAPTIONS   = 6
+_ORB_ROW_H      = 64   # height of the orb row section
+_CAP_W          = 490  # caption strip width (matches main widget)
+_CAP_MARGIN     = 5
 
-_cvi = tk.Frame(conv_panel, bg=_CV["panel_bg"], padx=10, pady=6)
-_cvi.pack(fill="both", expand=True)
+def _conv_blend(fg, bg, a):
+    fr,fg2,fb = int(fg[1:3],16),int(fg[3:5],16),int(fg[5:7],16)
+    br,bg2,bb = int(bg[1:3],16),int(bg[3:5],16),int(bg[5:7],16)
+    r=int(br+(fr-br)*a); g=int(bg2+(fg2-bg2)*a); b=int(bb+(fb-bb)*a)
+    return f"#{r:02x}{g:02x}{b:02x}"
 
-# --- Orb canvas (fixed height) ---
-_CONV_ORB_H = 72
-_conv_orb_canvas = tk.Canvas(_cvi, height=_CONV_ORB_H, bg=_CV["panel_bg"],
-                              highlightthickness=0, bd=0)
-_conv_orb_canvas.pack(fill="x", pady=(0, 4))
+# --- Orb row frame (packed into `frame`, same parent as prompt_panel/notes_panel)
+conv_panel = tk.Frame(frame, bg=_CV["orb_row_bg"], height=_ORB_ROW_H)
+tk.Frame(conv_panel, bg=_CV["accent"], height=2).pack(fill="x", side="top")
 
-# Orb drawing helpers
-_conv_orb_phase  = [0.0]
-_conv_orb_level  = [0.0]  # smoothed level for animation
+_conv_orb_canvas = tk.Canvas(conv_panel, height=_ORB_ROW_H - 2,
+                              bg=_CV["orb_row_bg"], highlightthickness=0, bd=0,
+                              cursor="hand2")
+_conv_orb_canvas.pack(fill="x", expand=True)
 
 _CONV_STATUS_LABELS = {
     "connecting": (_CV["orb_user"],  "CONNECTING..."),
     "listening":  (_CV["accent"],    "LISTENING"),
     "speaking":   (_CV["orb_ai"],    "GEMINI SPEAKING"),
-    "stopped":    (_CV["muted"],     "Tap START to begin"),
+    "stopped":    (_CV["muted"],     "TAP TO START"),
     "error":      ("#f87171",        "ERROR"),
 }
+_conv_last_status = ["stopped"]
 
-_conv_status_text_id = [None]
 
 def _conv_draw_orbs(state="stopped"):
-    _conv_orb_canvas.delete("all")
-    W = _conv_orb_canvas.winfo_width() or 480
-    cy = _CONV_ORB_H // 2
+    c = _conv_orb_canvas
+    c.delete("all")
+    W  = c.winfo_width() or 492
+    H  = _ORB_ROW_H - 2
+    cy = H // 2
     R  = 22
-
-    ai_lvl   = _conv_ai_level[0]
-    user_lvl = _conv_user_level[0]
-    t = _time.time()
-
-    def _blend(fg, bg, a):
-        fr,fg2,fb = int(fg[1:3],16),int(fg[3:5],16),int(fg[5:7],16)
-        br,bg2,bb = int(bg[1:3],16),int(bg[3:5],16),int(bg[5:7],16)
-        r=int(br+(fr-br)*a); g=int(bg2+(fg2-bg2)*a); b=int(bb+(fb-bb)*a)
-        return f"#{r:02x}{g:02x}{b:02x}"
+    t  = _time.time()
+    ui = _conv_user_level[0]
+    ai = _conv_ai_level[0]
 
     def _draw_orb(cx, lvl, color):
         idle = 0.05 + 0.03 * _math.sin(t * 3.0)
         lv   = max(lvl, idle)
         for i in range(3, 0, -1):
-            r   = R + lv * 10 * (i / 3)
-            col = _blend(color, _CV["panel_bg"], (45/i)/255.0)
-            _conv_orb_canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
-                                         fill="", outline=col, width=1.5)
-        r = R * (0.8 + lv * 0.3)
-        _conv_orb_canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
-                                     fill=color, outline="")
-        hr = r * 0.35
-        _conv_orb_canvas.create_oval(cx-hr*0.5, cy-r*0.5,
-                                     cx+hr*0.5, cy-r*0.5+hr,
-                                     fill="#ffffff", outline="")
+            rr  = R + lv * 12 * (i / 3)
+            col = _conv_blend(color, _CV["orb_row_bg"], (45/i)/255.0)
+            c.create_oval(cx-rr, cy-rr, cx+rr, cy+rr,
+                          fill="", outline=col, width=1.5)
+        rr = R * (0.8 + lv * 0.3)
+        c.create_oval(cx-rr, cy-rr, cx+rr, cy+rr, fill=color, outline="")
+        hr = rr * 0.35
+        c.create_oval(cx-hr*0.5, cy-rr*0.5, cx+hr*0.5, cy-rr*0.5+hr,
+                      fill="#ffffff", outline="")
 
-    _draw_orb(R + 8, user_lvl, _CV["orb_user"])   # user — left
-    _draw_orb(W - R - 8, ai_lvl, _CV["orb_ai"])   # AI   — right
+    _draw_orb(R + 10, ui, _CV["orb_user"])     # user — left
+    _draw_orb(W - R - 10, ai, _CV["orb_ai"])  # AI   — right
 
     col, txt = _CONV_STATUS_LABELS.get(state, (_CV["muted"], state.upper()))
-    _conv_orb_canvas.create_text(W//2, cy, text=txt,
-                                 font=(_UI_FONT or "Segoe UI", 9, "bold"),
-                                 fill=col, anchor="center")
+    c.create_text(W // 2, cy, text=txt,
+                  font=(_UI_FONT or "Segoe UI", 9, "bold"),
+                  fill=col, anchor="center")
 
-# Redraw whenever the canvas is resized (fires when the panel first becomes visible)
-def _conv_orb_canvas_resize(e):
-    _conv_draw_orbs(_conv_last_status[0])
-_conv_orb_canvas.bind("<Configure>", _conv_orb_canvas_resize)
+_conv_orb_canvas.bind("<Configure>", lambda e: _conv_draw_orbs(_conv_last_status[0]))
 
-_conv_last_status = ["stopped"]
+
+# ---------------------------------------------------------------------------
+# Caption Toplevel — transparent, floats below the expanded main widget
+# ---------------------------------------------------------------------------
+_TRANSP      = _CV["transp_key"]
+_conv_cap_win  = [None]
+_conv_caps_c   = [None]
+
+def _conv_build_caps():
+    win = tk.Toplevel(root)
+    win.overrideredirect(True)
+    win.attributes("-topmost", True)
+    win.configure(bg=_TRANSP)
+    try:
+        win.attributes("-transparentcolor", _TRANSP)
+    except Exception:
+        pass
+    win.withdraw()
+    caps_c = tk.Canvas(win, width=_CAP_W, height=0,
+                       bg=_TRANSP, highlightthickness=0)
+    caps_c.pack()
+    _conv_cap_win[0] = win
+    _conv_caps_c[0]  = caps_c
+
+_conv_build_caps()
+
+
+def _conv_caps_show():
+    """Position caption window below the expanded main widget."""
+    win = _conv_cap_win[0]
+    if win is None:
+        return
+    root.update_idletasks()
+    rx = root.winfo_x()
+    ry = root.winfo_y()
+    rh = root.winfo_height()
+    rw = root.winfo_width()
+    cx = rx + (rw - _CAP_W) // 2
+    cy = ry + rh + 4
+    cap_h = max(_conv_caps_c[0].winfo_reqheight(), 0)
+    win.geometry(f"{_CAP_W}x{max(cap_h,1)}+{cx}+{cy}")
+    win.deiconify()
+    win.lift()
+
+
+def _conv_caps_hide():
+    if _conv_cap_win[0]:
+        _conv_cap_win[0].withdraw()
+
+
+def _conv_caps_reposition(e=None):
+    """Keep caption window snapped below the main widget when it moves."""
+    if mode != "conv":
+        return
+    win = _conv_cap_win[0]
+    if win is None or win.state() == "withdrawn":
+        return
+    rx = root.winfo_x()
+    ry = root.winfo_y()
+    rh = root.winfo_height()
+    rw = root.winfo_width()
+    cx = rx + (rw - _CAP_W) // 2
+    cy = ry + rh + 4
+    win.geometry(f"+{cx}+{cy}")
+
+frame.bind("<Configure>", _conv_caps_reposition, add="+")
+
+
+def _conv_relayout_captions():
+    c = _conv_caps_c[0]
+    if c is None:
+        return
+    c.delete("all")
+    UI_FONT = _UI_FONT or "Segoe UI"
+    pad_h   = 8
+    badge_x = 12
+    text_x  = badge_x + 14
+    wrap_w  = _CAP_W - text_x - 16
+    y       = 0
+    total_h = 0
+    r       = 12  # corner radius for smooth polygon
+
+    def _rounded_rect(x0, y0, x1, y1, fill, outline):
+        # Smooth polygon — no jagged arcs
+        pts = [
+            x0+r, y0,   x1-r, y0,
+            x1,   y0,   x1,   y0+r,
+            x1,   y1-r, x1,   y1,
+            x1-r, y1,   x0+r, y1,
+            x0,   y1,   x0,   y1-r,
+            x0,   y0+r, x0,   y0,
+        ]
+        c.create_polygon(pts, smooth=True, fill=fill,
+                         outline=outline, width=1)
+
+    for speaker, text in _conv_cap_rows:
+        tmp = c.create_text(0, -999, text=text, font=(UI_FONT, 9),
+                            width=wrap_w, anchor="nw")
+        bb  = c.bbox(tmp); c.delete(tmp)
+        th  = (bb[3] - bb[1]) if bb else 14
+        row_h = max(th + pad_h * 2, 32)
+
+        _rounded_rect(2, y, _CAP_W - 2, y + row_h,
+                      fill=_CV["cap_pill_bg"], outline=_CV["cap_border"])
+
+        dot_c = _CV["orb_ai"] if speaker == "ai" else _CV["orb_user"]
+        by    = y + (row_h - 8) // 2
+        c.create_oval(badge_x, by, badge_x + 8, by + 8,
+                      fill=dot_c, outline="")
+
+        fg = _CV["gem_fg"] if speaker == "ai" else _CV["you_fg"]
+        c.create_text(text_x, y + pad_h, text=text, fill=fg,
+                      font=(UI_FONT, 9), width=wrap_w, anchor="nw")
+        y       += row_h + _CAP_MARGIN
+        total_h += row_h + _CAP_MARGIN
+
+    c.config(height=max(total_h, 0))
+    # Reposition the caption window
+    win = _conv_cap_win[0]
+    if win and total_h > 0:
+        root.update_idletasks()
+        rx2 = root.winfo_x()
+        ry2 = root.winfo_y()
+        rh2 = root.winfo_height()
+        rw2 = root.winfo_width()
+        cx2 = rx2 + (rw2 - _CAP_W) // 2
+        cy2 = ry2 + rh2 + 4
+        win.geometry(f"{_CAP_W}x{total_h}+{cx2}+{cy2}")
+        if mode == "conv":
+            win.deiconify()
+            win.lift()
+        if mode == "conv":
+            win.deiconify()
+            win.lift()
+
 
 def _conv_set_ui_status(status):
-    # Only store state + update top-bar label — never draw here.
-    # The single always-running animation loop owns all canvas drawing.
-    prev = _conv_last_status[0]
     _conv_last_status[0] = status
-    # listening↔speaking flips: skip top-bar churn, loop handles visuals
-    if status in ("listening", "speaking") and prev in ("listening", "speaking"):
-        return
     if status == "listening":
         focus_status.set(" Voice Chat — Listening")
         state_label.config(fg=_CV["accent"])
@@ -4496,121 +4827,31 @@ def _conv_set_ui_status(status):
     elif status == "error":
         focus_status.set(" Voice Chat — Error")
         state_label.config(fg="#f87171")
+    _conv_draw_orbs(status)
 
-# Single always-running loop started once — no start/stop, no stacking.
-# Level decay and canvas drawing happen here only.
-def _conv_animate():
-    st = _conv_last_status[0]
-    if _conv_is_connected:
-        _conv_ai_level[0]   *= 0.88
-        _conv_user_level[0] *= 0.88
-    _conv_draw_orbs(st)
-    root.after(40, _conv_animate)
-
-root.after(120, _conv_animate)  # start once after panel is built
-
-# Orb canvas is the tap-to-toggle control — no separate buttons needed
-_conv_orb_canvas.config(cursor="hand2")
-_conv_orb_hint = tk.Label(_cvi, text="You (left)  |  Gemini (right)   — tap orb to start / end",
-                           font=(_UI_FONT or "Segoe UI", 7), fg=_CV["muted"],
-                           bg=_CV["panel_bg"])
-_conv_orb_hint.pack(fill="x", pady=(0, 2))
-
-# --- Divider ---
-tk.Frame(_cvi, bg=_CV["muted"], height=1).pack(fill="x", pady=(0, 6))
-
-# --- Transcript ---
-_conv_tx_hdr = tk.Frame(_cvi, bg=_CV["panel_bg"])
-_conv_tx_hdr.pack(fill="x", pady=(0, 4))
-tk.Label(_conv_tx_hdr, text="TRANSCRIPT",
-         font=(_UI_FONT or "Segoe UI", 7, "bold"),
-         fg=_CV["muted"], bg=_CV["panel_bg"], anchor="w").pack(side="left")
-_conv_clr_lbl = tk.Label(_conv_tx_hdr, text="clear",
-                          font=(_UI_FONT or "Segoe UI", 7),
-                          fg=_CV["muted"], bg=_CV["panel_bg"], cursor="hand2")
-_conv_clr_lbl.pack(side="right")
-
-_conv_tx_outer = tk.Frame(_cvi, bg=_CV["panel_bg"])
-_conv_tx_outer.pack(fill="both", expand=True)
-
-_conv_tx_canvas = tk.Canvas(_conv_tx_outer, bg=_CV["panel_bg"],
-                             highlightthickness=0, bd=0)
-_conv_tx_vsb = ttk.Scrollbar(_conv_tx_outer, orient="vertical",
-                              command=_conv_tx_canvas.yview)
-_conv_tx_vsb.pack(side="right", fill="y")
-_conv_tx_canvas.pack(side="left", fill="both", expand=True)
-_conv_tx_canvas.configure(yscrollcommand=_conv_tx_vsb.set)
-
-_conv_tx_msgs = tk.Frame(_conv_tx_canvas, bg=_CV["panel_bg"])
-_conv_tx_win  = _conv_tx_canvas.create_window((0, 0), window=_conv_tx_msgs, anchor="nw")
-
-def _conv_tx_scroll_update(e=None):
-    _conv_tx_canvas.update_idletasks()
-    bb = _conv_tx_canvas.bbox("all")
-    if bb:
-        _conv_tx_canvas.configure(
-            scrollregion=(0, 0, bb[2], max(bb[3], _conv_tx_canvas.winfo_height())))
-    _conv_tx_canvas.yview_moveto(1.0)
-
-_conv_tx_msgs.bind("<Configure>", _conv_tx_scroll_update)
-_conv_tx_canvas.bind("<Configure>",
-    lambda e: (_conv_tx_canvas.itemconfig(_conv_tx_win, width=e.width),
-               _conv_tx_scroll_update()))
 
 def _conv_push_caption(speaker, text):
-    """Add or update a transcript row. Called on Tk thread via root.after."""
-    children = _conv_tx_msgs.winfo_children()
-    # Update in-place if same speaker is still talking
-    if children:
-        last = children[-1]
-        if getattr(last, "_conv_speaker", None) == speaker:
-            lbl = getattr(last, "_conv_text_lbl", None)
-            if lbl:
-                lbl.config(text=text)
-                _conv_tx_scroll_update()
-                return
+    if _conv_cap_rows and _conv_cap_rows[-1][0] == speaker:
+        _conv_cap_rows[-1][1] = text
+    else:
+        _conv_cap_rows.append([speaker, text])
+    if len(_conv_cap_rows) > _MAX_CAPTIONS:
+        del _conv_cap_rows[:-_MAX_CAPTIONS]
+    _conv_relayout_captions()
 
-    is_ai  = speaker == "ai"
-    bbg    = _CV["bubble_gem"] if is_ai else _CV["bubble_you"]
-    tfg    = _CV["gem_fg"]     if is_ai else _CV["you_fg"]
-    dot_c  = _CV["orb_ai"]    if is_ai else _CV["orb_user"]
-    lbl_c  = _CV["accent_text"] if is_ai else _CV["muted"]
-
-    row = tk.Frame(_conv_tx_msgs, bg=_CV["panel_bg"])
-    row._conv_speaker = speaker
-    row.pack(fill="x", pady=2, padx=6)
-
-    hdr = tk.Frame(row, bg=_CV["panel_bg"])
-    hdr.pack(fill="x")
-    dot = tk.Canvas(hdr, width=10, height=10, bg=_CV["panel_bg"],
-                    highlightthickness=0)
-    dot.create_oval(1, 1, 9, 9, fill=dot_c, outline="")
-    dot.pack(side="left", padx=(0, 4))
-    tk.Label(hdr, text="Gemini" if is_ai else "You",
-             font=(_UI_FONT or "Segoe UI", 7, "bold"),
-             fg=lbl_c, bg=_CV["panel_bg"]).pack(side="left")
-
-    bubble = tk.Frame(row, bg=bbg, padx=8, pady=4)
-    bubble.pack(fill="x")
-    text_lbl = tk.Label(bubble, text=text, font=(_UI_FONT or "Segoe UI", 9),
-                        fg=tfg, bg=bbg, anchor="w", justify="left",
-                        wraplength=430)
-    text_lbl.pack(fill="x")
-    # Store direct ref so updates don't require widget-tree traversal
-    row._conv_text_lbl = text_lbl
-
-    _conv_tx_scroll_update()
 
 def _conv_clear_transcript():
-    for w in _conv_tx_msgs.winfo_children():
-        w.destroy()
+    _conv_cap_rows.clear()
+    c = _conv_caps_c[0]
+    if c:
+        c.delete("all")
+        c.config(height=0)
+    if _conv_cap_win[0]:
+        _conv_cap_win[0].withdraw()
 
-def _conv_clr_lbl_clear(e):
-    _conv_clear_transcript()
-_conv_clr_lbl.bind("<Button-1>", _conv_clr_lbl_clear)
 
-# Orb canvas tap = toggle session
-def _conv_toggle(e=None):
+# Tap orb row to toggle session
+def _conv_orb_tap(e):
     if _conv_is_connected:
         stop_conv()
         for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv):
@@ -4622,9 +4863,19 @@ def _conv_toggle(e=None):
             except Exception: pass
         start_conv()
 
-_conv_orb_canvas.bind("<Button-1>", _conv_toggle)
+_conv_orb_canvas.bind("<Button-1>", _conv_orb_tap)
 
-# Patch _on_conv_ended to re-enable mode buttons
+# Animation loop — always running
+def _conv_animate():
+    if _conv_is_connected:
+        _conv_ai_level[0]   *= 0.88
+        _conv_user_level[0] *= 0.88
+    _conv_draw_orbs(_conv_last_status[0])
+    root.after(30, _conv_animate)
+
+root.after(120, _conv_animate)
+
+# Patch _on_conv_ended
 _orig_on_conv_ended = _on_conv_ended
 def _on_conv_ended():
     _orig_on_conv_ended()
@@ -4632,23 +4883,10 @@ def _on_conv_ended():
         for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv):
             try: _mb.config(state="normal")
             except Exception: pass
+        _conv_draw_orbs("stopped")
     except Exception:
         pass
-
 # ---------------------------------------------------------------------------
-# Allow the widget to be moved without changing focus semantics.
-def drag_start(event):
-    root._drag_x = event.x_root - root.winfo_x()
-    root._drag_y = event.y_root - root.winfo_y()
-
-
-def drag_move(event):
-    root.geometry(f"+{event.x_root - root._drag_x}+{event.y_root - root._drag_y}")
-
-for w in (frame, pill):
-    w.bind("<Button-1>", drag_start)
-    w.bind("<B1-Motion>", drag_move)
-
 # ---------------------------------------------------------------------------
 # System tray icon
 # ---------------------------------------------------------------------------
