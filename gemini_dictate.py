@@ -1,10 +1,12 @@
 import re
 import asyncio
+import base64
 import ctypes
 import json
 import logging
 import os
 import queue
+import struct
 import subprocess
 import threading
 import time
@@ -14,7 +16,9 @@ import tkinter.font as tkfont
 from tkinter import ttk
 
 import numpy as np
+import pyaudio
 import sounddevice as sd
+import websockets as _conv_ws
 from scipy.signal import resample_poly
 from google import genai
 from google.genai import types
@@ -115,6 +119,256 @@ _prompt_progressive_text = ""  # progressive words accumulated within the curren
 _last_prompt_result = ""    # stores last rewritten output for undo
 _prompt_history = []        # list of dicts: {raw, result} — max 10
 _history_index = -1         # -1 = not browsing history; 0 = most recent
+
+# ---------------------------------------------------------------------------
+# CONV mode state
+# ---------------------------------------------------------------------------
+CONV_MODEL   = "models/gemini-2.5-flash-native-audio-latest"
+CONV_WS_URL  = (
+    "wss://generativelanguage.googleapis.com/ws/"
+    "google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent"
+)
+CONV_INPUT_RATE  = 16000
+CONV_CHUNK       = 1600      # 100 ms @ 16 kHz
+CONV_OUTPUT_RATE = 24000
+
+_conv_is_connected = False
+_conv_engine       = None    # AudioEngine instance while session is active
+_conv_ai_level     = [0.0]
+_conv_user_level   = [0.0]
+
+
+def _conv_rms(data: bytes) -> float:
+    if not data:
+        return 0.0
+    count = len(data) // 2
+    if not count:
+        return 0.0
+    shorts = struct.unpack(f"{count}h", data[:count * 2])
+    return (sum(s * s for s in shorts) / count) ** 0.5
+
+
+class _ConvAudioEngine:
+    """Owns one PyAudio instance + both streams. Mirrors AudioEngine in the
+    proven standalone reference — single object, no separate playback thread."""
+
+    def __init__(self, on_status, on_ai_rms, on_user_rms, on_caption):
+        self.stop_event    = threading.Event()
+        self.audio         = pyaudio.PyAudio()
+        self.input_stream  = None
+        self.output_stream = None
+        self.ws            = None
+        self.on_status     = on_status
+        self.on_ai_rms     = on_ai_rms
+        self.on_user_rms   = on_user_rms
+        self.on_caption    = on_caption
+        self._ai_buf       = ""
+        self._user_buf     = ""
+
+    def start_audio(self):
+        self.input_stream = self.audio.open(
+            format=pyaudio.paInt16, channels=1,
+            rate=CONV_INPUT_RATE, input=True,
+            frames_per_buffer=CONV_CHUNK,
+        )
+        self.output_stream = self.audio.open(
+            format=pyaudio.paInt16, channels=1,
+            rate=CONV_OUTPUT_RATE, output=True,
+        )
+
+    def close_audio(self):
+        for s in (self.input_stream, self.output_stream):
+            if s:
+                try: s.stop_stream()
+                except Exception: pass
+                try: s.close()
+                except Exception: pass
+        self.input_stream = self.output_stream = None
+        try: self.audio.terminate()
+        except Exception: pass
+
+    async def send_microphone(self):
+        loop = asyncio.get_running_loop()
+        while not self.stop_event.is_set():
+            try:
+                chunk = await loop.run_in_executor(
+                    None, self.input_stream.read, CONV_CHUNK, False)
+                if not chunk:
+                    continue
+                self.on_user_rms(min(_conv_rms(chunk) / 3500.0, 1.0))
+                await self.ws.send(json.dumps({
+                    "realtimeInput": {
+                        "audio": {
+                            "data": base64.b64encode(chunk).decode("ascii"),
+                            "mimeType": "audio/pcm;rate=16000",
+                        }
+                    }
+                }))
+            except Exception:
+                break
+
+    async def receive_gemini(self):
+        loop = asyncio.get_running_loop()
+        while not self.stop_event.is_set():
+            try:
+                raw = await self.ws.recv()
+                msg = json.loads(raw)
+            except Exception:
+                break
+
+            sc = msg.get("serverContent")
+            if not sc:
+                continue
+
+            for part in sc.get("modelTurn", {}).get("parts", []):
+                inline = part.get("inlineData")
+                if inline and inline.get("data"):
+                    pcm = base64.b64decode(inline["data"])
+                    self.on_ai_rms(min(_conv_rms(pcm) / 5000.0, 1.0))
+                    self.on_status("speaking")
+                    if self.output_stream:
+                        await loop.run_in_executor(None, self.output_stream.write, pcm)
+
+            out_text = sc.get("outputTranscription", {}).get("text", "")
+            if out_text:
+                self._ai_buf += out_text
+                self.on_caption("ai", self._ai_buf)
+
+            in_text = sc.get("inputTranscription", {}).get("text", "")
+            if in_text:
+                self._user_buf += in_text
+                self.on_caption("user", self._user_buf)
+
+            if sc.get("turnComplete"):
+                self._ai_buf = ""
+                self._user_buf = ""
+                self.on_ai_rms(0.0)
+                self.on_status("listening")
+
+            if sc.get("interrupted"):
+                self._ai_buf = ""
+                self._user_buf = ""
+                self.on_ai_rms(0.0)
+                self.on_status("listening")
+
+
+def _conv_on_ai_rms(v):
+    _conv_ai_level[0] = max(_conv_ai_level[0], v)
+
+
+def _conv_on_user_rms(v):
+    _conv_user_level[0] = max(_conv_user_level[0], v)
+
+
+def _conv_on_status(status):
+    root.after(0, _conv_set_ui_status, status)
+
+
+def _conv_on_caption(speaker, text):
+    root.after(0, _conv_push_caption, speaker, text)
+
+
+def _run_conv_loop():
+    """Each session gets its own fresh event loop — same pattern as standalone."""
+    lp = asyncio.new_event_loop()
+    asyncio.set_event_loop(lp)
+    lp.run_until_complete(_gemini_live_conv())
+
+
+async def _gemini_live_conv():
+    global _conv_is_connected, _conv_engine
+    key = os.environ.get("GEMINI_API_KEY")
+    url = CONV_WS_URL + f"?key={key}"
+    try:
+        async with _conv_ws.connect(
+            url, max_size=None, ping_interval=20, ping_timeout=20
+        ) as ws:
+            await ws.send(json.dumps({
+                "setup": {
+                    "model": CONV_MODEL,
+                    "generationConfig": {"responseModalities": ["AUDIO"]},
+                    "inputAudioTranscription":  {},
+                    "outputAudioTranscription": {},
+                }
+            }))
+            resp = json.loads(await ws.recv())
+            if "setupComplete" not in resp:
+                _conv_on_status("error")
+                return
+
+            engine = _ConvAudioEngine(
+                on_status   = _conv_on_status,
+                on_ai_rms   = _conv_on_ai_rms,
+                on_user_rms = _conv_on_user_rms,
+                on_caption  = _conv_on_caption,
+            )
+            engine.ws = ws
+            _conv_engine = engine
+            engine.start_audio()
+            _conv_on_status("listening")
+
+            mic_task = asyncio.create_task(engine.send_microphone())
+            rx_task  = asyncio.create_task(engine.receive_gemini())
+
+            while _conv_is_connected and not engine.stop_event.is_set():
+                await asyncio.sleep(0.1)
+
+            engine.stop_event.set()
+            mic_task.cancel()
+            rx_task.cancel()
+            engine.close_audio()
+
+    except Exception as ex:
+        L("CONV SESSION ERROR: %s\n%s", ex, traceback.format_exc())
+        _conv_on_status("error")
+        root.after(0, _conv_push_caption, "ai", f"Error: {str(ex)[:60]}")
+    finally:
+        _conv_is_connected = False
+        root.after(0, _on_conv_ended)
+
+
+def start_conv():
+    global _conv_is_connected, _conv_engine
+    if _conv_is_connected:
+        return
+    if not os.environ.get("GEMINI_API_KEY"):
+        focus_status.set("GEMINI_API_KEY missing")
+        return
+    _conv_is_connected = True
+    _conv_ai_level[0]   = 0.0
+    _conv_user_level[0] = 0.0
+    root.after(0, _conv_set_ui_status, "connecting")
+    root.after(0, _conv_clear_transcript)
+    threading.Thread(target=_run_conv_loop, daemon=True).start()
+    L("CONV SESSION STARTED")
+
+
+def stop_conv():
+    global _conv_is_connected
+    if not _conv_is_connected:
+        return
+    _conv_is_connected = False
+    if _conv_engine:
+        _conv_engine.stop_event.set()
+    root.after(0, _conv_set_ui_status, "stopped")
+    L("CONV SESSION STOPPED")
+
+
+def _on_conv_ended():
+    """Called on Tk thread when session coroutine exits."""
+    global _conv_engine
+    _conv_engine = None
+    _conv_ai_level[0]   = 0.0
+    _conv_user_level[0] = 0.0
+    _conv_set_ui_status("stopped")
+    # Re-enable mode buttons
+    mode_live.config(state="normal")
+    mode_buf.config(state="normal")
+    mode_pro.config(state="normal")
+    try: mode_not.config(state="normal")
+    except Exception: pass
+    try: mode_conv.config(state="normal")
+    except Exception: pass
 
 # Notes
 NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.json")
@@ -603,12 +857,14 @@ def update_focus_tracking():
             (is_editable_uia(u) and (not u or u.get("ProcessId") != our_pid))
             or is_editable_window_fallback(top, u)
         )
-        if editable:
-            focus_status.set("FIELD READY")
-            state_label.config(fg="#f4f4f5")
-        else:
-            focus_status.set(" Dictate")
-            state_label.config(fg=MUTED)
+        # Skip field-ready feedback while CONV is active — irrelevant there
+        if mode != "conv":
+            if editable:
+                focus_status.set("FIELD READY")
+                state_label.config(fg="#f4f4f5")
+            else:
+                focus_status.set(" Dictate")
+                state_label.config(fg=MUTED)
 
     root.after(FOCUS_POLL_MS, update_focus_tracking)
 
@@ -1824,6 +2080,22 @@ def _update_history_nav():
         pass
 
 
+def toggle_conv_panel(show):
+    """Expand/collapse the CONV panel."""
+    if show:
+        prompt_panel.pack_forget()
+        notes_panel.pack_forget()
+        conv_panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+        _notes_canvas.unbind_all("<MouseWheel>")
+    else:
+        if _conv_is_connected:
+            stop_conv()
+        try:
+            conv_panel.pack_forget()
+        except Exception:
+            pass
+
+
 def toggle_prompt_panel(show):
     """Expand/collapse the PROMPT panel and resize the widget."""
     global prompt_mode_active
@@ -2177,6 +2449,7 @@ def set_mode(new_mode):
     UNSEL_FG = "#52525b"
     is_prompt = (mode == "prompt")
     is_notes  = (mode == "notes")
+    is_conv   = (mode == "conv")
     mode_live.config(bg=SEL_BG if mode == "live"     else UNSEL_BG,
                      fg=SEL_FG if mode == "live"     else UNSEL_FG)
     mode_buf.config( bg=SEL_BG if mode == "buffered" else UNSEL_BG,
@@ -2185,25 +2458,28 @@ def set_mode(new_mode):
                      fg=SEL_FG if is_prompt          else UNSEL_FG)
     mode_not.config( bg=SEL_BG if is_notes           else UNSEL_BG,
                      fg=SEL_FG if is_notes           else UNSEL_FG)
+    mode_conv.config(bg=SEL_BG if is_conv            else UNSEL_BG,
+                     fg=SEL_FG if is_conv            else UNSEL_FG)
 
     # Set geometry FIRST — before panels pack, to avoid the resize glitch
     x, y = root.winfo_x(), root.winfo_y()
-    if is_prompt or is_notes:
+    if is_prompt or is_notes or is_conv:
         root.geometry(f"500x500+{x}+{y}")
     else:
         root.geometry(f"500x54+{x}+{y}")
 
+    toggle_conv_panel(is_conv)
     toggle_prompt_panel(is_prompt)
     toggle_notes_panel(is_notes)
 
-    # Hide main mic in NTS (it has its own orb in the note editor)
-    if is_notes:
+    # Hide main mic in NTS and CONV
+    if is_notes or is_conv:
         btn.grid_remove()
     else:
         btn.grid()
 
-    # Hide lock button on PRO and NTS — only relevant for LIVE/BUF external field targeting
-    if is_prompt or is_notes:
+    # Hide lock button on PRO, NTS, CONV
+    if is_prompt or is_notes or is_conv:
         lock_btn.grid_remove()
     else:
         lock_btn.grid()
@@ -2214,6 +2490,10 @@ def set_mode(new_mode):
     elif is_notes:
         mode_help.set("NOTES")
         focus_status.set(" Dictate")
+        state_label.config(fg=MUTED)
+    elif is_conv:
+        mode_help.set("CONV")
+        focus_status.set(" Voice Chat")
         state_label.config(fg=MUTED)
     else:
         mode_help.set("LIVE" if mode == "live" else "BUFFER")
@@ -2253,6 +2533,8 @@ def open_widget():
 def close_widget():
     if recording:
         stop_record("widget closed")
+    if _conv_is_connected:
+        stop_conv()
     root.withdraw()
     root.attributes("-topmost", False)
     reset_widget_state()
@@ -2578,13 +2860,14 @@ clipboard_fallback_canvas.create_line(8, 12, 12, 12, fill="#22c55e", width=1.2, 
 clipboard_fallback_canvas.itemconfigure("clip", state="hidden")
 clipboard_fallback_label = clipboard_fallback_canvas
 
-mode_wrap = tk.Frame(pill, bg="#1a1a1f", bd=0, relief="flat", width=160, height=34)
+mode_wrap = tk.Frame(pill, bg="#1a1a1f", bd=0, relief="flat", width=200, height=34)
 mode_wrap.grid(row=0, column=1, sticky="w", padx=(0, 8))
 mode_wrap.grid_propagate(False)
 mode_wrap.grid_columnconfigure(0, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(1, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(2, weight=1, uniform="mode")
 mode_wrap.grid_columnconfigure(3, weight=1, uniform="mode")
+mode_wrap.grid_columnconfigure(4, weight=1, uniform="mode")
 mode_live = tk.Button(mode_wrap, text="LIVE", command=lambda: set_mode("live"),
     font=(_UI_FONT or "Segoe UI", 8, "bold"), fg="#f4f4f5", bg="#2d2d35",
     activebackground="#52525b", activeforeground="white", relief="flat", bd=0,
@@ -2605,6 +2888,11 @@ mode_not = tk.Button(mode_wrap, text="NTS", command=lambda: set_mode("notes"),
     activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
     cursor="hand2")
 mode_not.grid(row=0, column=3, sticky="nsew", padx=1, pady=1)
+mode_conv = tk.Button(mode_wrap, text="CONV", command=lambda: set_mode("conv"),
+    font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
+    activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
+    cursor="hand2")
+mode_conv.grid(row=0, column=4, sticky="nsew", padx=1, pady=1)
 mode_label = mode_live
 
 btn = tk.Canvas(
@@ -4086,6 +4374,266 @@ def _notes_open_editor(note=None):
 
 _notes_add_lbl.bind("<Button-1>", lambda e: _notes_open_editor())
 _notes_search_entry.bind("<KeyRelease>", lambda e: _notes_render_list())
+
+# ---------------------------------------------------------------------------
+# CONV panel — Voice conversation (Gemini 2.5 Flash Native Audio)
+# ---------------------------------------------------------------------------
+import math as _math
+import random as _random
+import time as _time
+import struct as _struct
+
+# Palette for CONV
+_CV = {
+    "panel_bg":   "#0a0a10",
+    "accent":     "#818cf8",
+    "accent_text":"#a5b4fc",
+    "muted":      "#475569",
+    "you_fg":     "#e2e8f0",
+    "gem_fg":     "#a5b4fc",
+    "bubble_you": "#1e1b4b",
+    "bubble_gem": "#0f0f1a",
+    "orb_user":   "#818cf8",
+    "orb_ai":     "#34d399",
+    "stop_fg":    "#f87171",
+    "stop_bg":    "#1c0a0a",
+    "status_fg":  "#64748b",
+}
+
+conv_panel = tk.Frame(frame, bg=_CV["panel_bg"])
+tk.Frame(conv_panel, bg=_CV["accent"], height=2).pack(fill="x")
+
+_cvi = tk.Frame(conv_panel, bg=_CV["panel_bg"], padx=10, pady=6)
+_cvi.pack(fill="both", expand=True)
+
+# --- Orb canvas (fixed height) ---
+_CONV_ORB_H = 72
+_conv_orb_canvas = tk.Canvas(_cvi, height=_CONV_ORB_H, bg=_CV["panel_bg"],
+                              highlightthickness=0, bd=0)
+_conv_orb_canvas.pack(fill="x", pady=(0, 4))
+
+# Orb drawing helpers
+_conv_orb_phase  = [0.0]
+_conv_orb_level  = [0.0]  # smoothed level for animation
+
+_CONV_STATUS_LABELS = {
+    "connecting": (_CV["orb_user"],  "CONNECTING..."),
+    "listening":  (_CV["accent"],    "LISTENING"),
+    "speaking":   (_CV["orb_ai"],    "GEMINI SPEAKING"),
+    "stopped":    (_CV["muted"],     "Tap START to begin"),
+    "error":      ("#f87171",        "ERROR"),
+}
+
+_conv_status_text_id = [None]
+
+def _conv_draw_orbs(state="stopped"):
+    _conv_orb_canvas.delete("all")
+    W = _conv_orb_canvas.winfo_width() or 480
+    cy = _CONV_ORB_H // 2
+    R  = 22
+
+    ai_lvl   = _conv_ai_level[0]
+    user_lvl = _conv_user_level[0]
+    t = _time.time()
+
+    def _blend(fg, bg, a):
+        fr,fg2,fb = int(fg[1:3],16),int(fg[3:5],16),int(fg[5:7],16)
+        br,bg2,bb = int(bg[1:3],16),int(bg[3:5],16),int(bg[5:7],16)
+        r=int(br+(fr-br)*a); g=int(bg2+(fg2-bg2)*a); b=int(bb+(fb-bb)*a)
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+    def _draw_orb(cx, lvl, color):
+        idle = 0.05 + 0.03 * _math.sin(t * 3.0)
+        lv   = max(lvl, idle)
+        for i in range(3, 0, -1):
+            r   = R + lv * 10 * (i / 3)
+            col = _blend(color, _CV["panel_bg"], (45/i)/255.0)
+            _conv_orb_canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                         fill="", outline=col, width=1.5)
+        r = R * (0.8 + lv * 0.3)
+        _conv_orb_canvas.create_oval(cx-r, cy-r, cx+r, cy+r,
+                                     fill=color, outline="")
+        hr = r * 0.35
+        _conv_orb_canvas.create_oval(cx-hr*0.5, cy-r*0.5,
+                                     cx+hr*0.5, cy-r*0.5+hr,
+                                     fill="#ffffff", outline="")
+
+    _draw_orb(R + 8, user_lvl, _CV["orb_user"])   # user — left
+    _draw_orb(W - R - 8, ai_lvl, _CV["orb_ai"])   # AI   — right
+
+    col, txt = _CONV_STATUS_LABELS.get(state, (_CV["muted"], state.upper()))
+    _conv_orb_canvas.create_text(W//2, cy, text=txt,
+                                 font=(_UI_FONT or "Segoe UI", 9, "bold"),
+                                 fill=col, anchor="center")
+
+# Redraw whenever the canvas is resized (fires when the panel first becomes visible)
+def _conv_orb_canvas_resize(e):
+    _conv_draw_orbs(_conv_last_status[0])
+_conv_orb_canvas.bind("<Configure>", _conv_orb_canvas_resize)
+
+_conv_last_status = ["stopped"]
+
+def _conv_set_ui_status(status):
+    # Only store state + update top-bar label — never draw here.
+    # The single always-running animation loop owns all canvas drawing.
+    prev = _conv_last_status[0]
+    _conv_last_status[0] = status
+    # listening↔speaking flips: skip top-bar churn, loop handles visuals
+    if status in ("listening", "speaking") and prev in ("listening", "speaking"):
+        return
+    if status == "listening":
+        focus_status.set(" Voice Chat — Listening")
+        state_label.config(fg=_CV["accent"])
+    elif status == "speaking":
+        focus_status.set(" Voice Chat — Gemini Speaking")
+        state_label.config(fg=_CV["orb_ai"])
+    elif status == "connecting":
+        focus_status.set(" Voice Chat — Connecting")
+        state_label.config(fg=_CV["orb_user"])
+    elif status == "stopped":
+        focus_status.set(" Voice Chat")
+        state_label.config(fg=MUTED)
+    elif status == "error":
+        focus_status.set(" Voice Chat — Error")
+        state_label.config(fg="#f87171")
+
+# Single always-running loop started once — no start/stop, no stacking.
+# Level decay and canvas drawing happen here only.
+def _conv_animate():
+    st = _conv_last_status[0]
+    if _conv_is_connected:
+        _conv_ai_level[0]   *= 0.88
+        _conv_user_level[0] *= 0.88
+    _conv_draw_orbs(st)
+    root.after(40, _conv_animate)
+
+root.after(120, _conv_animate)  # start once after panel is built
+
+# Orb canvas is the tap-to-toggle control — no separate buttons needed
+_conv_orb_canvas.config(cursor="hand2")
+_conv_orb_hint = tk.Label(_cvi, text="You (left)  |  Gemini (right)   — tap orb to start / end",
+                           font=(_UI_FONT or "Segoe UI", 7), fg=_CV["muted"],
+                           bg=_CV["panel_bg"])
+_conv_orb_hint.pack(fill="x", pady=(0, 2))
+
+# --- Divider ---
+tk.Frame(_cvi, bg=_CV["muted"], height=1).pack(fill="x", pady=(0, 6))
+
+# --- Transcript ---
+_conv_tx_hdr = tk.Frame(_cvi, bg=_CV["panel_bg"])
+_conv_tx_hdr.pack(fill="x", pady=(0, 4))
+tk.Label(_conv_tx_hdr, text="TRANSCRIPT",
+         font=(_UI_FONT or "Segoe UI", 7, "bold"),
+         fg=_CV["muted"], bg=_CV["panel_bg"], anchor="w").pack(side="left")
+_conv_clr_lbl = tk.Label(_conv_tx_hdr, text="clear",
+                          font=(_UI_FONT or "Segoe UI", 7),
+                          fg=_CV["muted"], bg=_CV["panel_bg"], cursor="hand2")
+_conv_clr_lbl.pack(side="right")
+
+_conv_tx_outer = tk.Frame(_cvi, bg=_CV["panel_bg"])
+_conv_tx_outer.pack(fill="both", expand=True)
+
+_conv_tx_canvas = tk.Canvas(_conv_tx_outer, bg=_CV["panel_bg"],
+                             highlightthickness=0, bd=0)
+_conv_tx_vsb = ttk.Scrollbar(_conv_tx_outer, orient="vertical",
+                              command=_conv_tx_canvas.yview)
+_conv_tx_vsb.pack(side="right", fill="y")
+_conv_tx_canvas.pack(side="left", fill="both", expand=True)
+_conv_tx_canvas.configure(yscrollcommand=_conv_tx_vsb.set)
+
+_conv_tx_msgs = tk.Frame(_conv_tx_canvas, bg=_CV["panel_bg"])
+_conv_tx_win  = _conv_tx_canvas.create_window((0, 0), window=_conv_tx_msgs, anchor="nw")
+
+def _conv_tx_scroll_update(e=None):
+    _conv_tx_canvas.update_idletasks()
+    bb = _conv_tx_canvas.bbox("all")
+    if bb:
+        _conv_tx_canvas.configure(
+            scrollregion=(0, 0, bb[2], max(bb[3], _conv_tx_canvas.winfo_height())))
+    _conv_tx_canvas.yview_moveto(1.0)
+
+_conv_tx_msgs.bind("<Configure>", _conv_tx_scroll_update)
+_conv_tx_canvas.bind("<Configure>",
+    lambda e: (_conv_tx_canvas.itemconfig(_conv_tx_win, width=e.width),
+               _conv_tx_scroll_update()))
+
+def _conv_push_caption(speaker, text):
+    """Add or update a transcript row. Called on Tk thread via root.after."""
+    children = _conv_tx_msgs.winfo_children()
+    # Update in-place if same speaker is still talking
+    if children:
+        last = children[-1]
+        if getattr(last, "_conv_speaker", None) == speaker:
+            lbl = getattr(last, "_conv_text_lbl", None)
+            if lbl:
+                lbl.config(text=text)
+                _conv_tx_scroll_update()
+                return
+
+    is_ai  = speaker == "ai"
+    bbg    = _CV["bubble_gem"] if is_ai else _CV["bubble_you"]
+    tfg    = _CV["gem_fg"]     if is_ai else _CV["you_fg"]
+    dot_c  = _CV["orb_ai"]    if is_ai else _CV["orb_user"]
+    lbl_c  = _CV["accent_text"] if is_ai else _CV["muted"]
+
+    row = tk.Frame(_conv_tx_msgs, bg=_CV["panel_bg"])
+    row._conv_speaker = speaker
+    row.pack(fill="x", pady=2, padx=6)
+
+    hdr = tk.Frame(row, bg=_CV["panel_bg"])
+    hdr.pack(fill="x")
+    dot = tk.Canvas(hdr, width=10, height=10, bg=_CV["panel_bg"],
+                    highlightthickness=0)
+    dot.create_oval(1, 1, 9, 9, fill=dot_c, outline="")
+    dot.pack(side="left", padx=(0, 4))
+    tk.Label(hdr, text="Gemini" if is_ai else "You",
+             font=(_UI_FONT or "Segoe UI", 7, "bold"),
+             fg=lbl_c, bg=_CV["panel_bg"]).pack(side="left")
+
+    bubble = tk.Frame(row, bg=bbg, padx=8, pady=4)
+    bubble.pack(fill="x")
+    text_lbl = tk.Label(bubble, text=text, font=(_UI_FONT or "Segoe UI", 9),
+                        fg=tfg, bg=bbg, anchor="w", justify="left",
+                        wraplength=430)
+    text_lbl.pack(fill="x")
+    # Store direct ref so updates don't require widget-tree traversal
+    row._conv_text_lbl = text_lbl
+
+    _conv_tx_scroll_update()
+
+def _conv_clear_transcript():
+    for w in _conv_tx_msgs.winfo_children():
+        w.destroy()
+
+def _conv_clr_lbl_clear(e):
+    _conv_clear_transcript()
+_conv_clr_lbl.bind("<Button-1>", _conv_clr_lbl_clear)
+
+# Orb canvas tap = toggle session
+def _conv_toggle(e=None):
+    if _conv_is_connected:
+        stop_conv()
+        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv):
+            try: _mb.config(state="normal")
+            except Exception: pass
+    else:
+        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv):
+            try: _mb.config(state="disabled")
+            except Exception: pass
+        start_conv()
+
+_conv_orb_canvas.bind("<Button-1>", _conv_toggle)
+
+# Patch _on_conv_ended to re-enable mode buttons
+_orig_on_conv_ended = _on_conv_ended
+def _on_conv_ended():
+    _orig_on_conv_ended()
+    try:
+        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv):
+            try: _mb.config(state="normal")
+            except Exception: pass
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
 # Allow the widget to be moved without changing focus semantics.
