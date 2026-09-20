@@ -119,6 +119,7 @@ _history_index = -1         # -1 = not browsing history; 0 = most recent
 # Notes
 NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.json")
 _notes_data = []
+_open_editor_windows = []   # all currently open note editor Toplevel windows
 
 def _notes_load():
     global _notes_data
@@ -1981,7 +1982,7 @@ def start_record():
     if focus_lock:
         # Show the locked target app so user knows where output goes
         locked_app = (top.get("process") or "?").replace(".exe", "")
-        focus_status.set(f"🔒 {locked_app}")
+        focus_status.set(f"LOCKED: {locked_app}")
     else:
         focus_status.set(" RECORDING")
     btn.unbind("<Button-1>")
@@ -2184,26 +2185,28 @@ def set_mode(new_mode):
                      fg=SEL_FG if is_prompt          else UNSEL_FG)
     mode_not.config( bg=SEL_BG if is_notes           else UNSEL_BG,
                      fg=SEL_FG if is_notes           else UNSEL_FG)
-    toggle_prompt_panel(is_prompt)
-    toggle_notes_panel(is_notes)
 
-    # NOTES uses the dedicated mic/orb in the New Note editor header.
-    # Hide the main widget mic completely while NOTES is active; restore it
-    # for LIVE / BUF / PRO. Also collapse its reserved grid column so the
-    # header does not leave an empty gap.
-    if is_notes:
-        btn.grid_remove()
-        pill.grid_columnconfigure(2, minsize=0, weight=0)
-    else:
-        pill.grid_columnconfigure(2, minsize=75, weight=0)
-        btn.grid()
-
-    # Single geometry call after panels are shown/hidden — both expanded tabs use same height
+    # Set geometry FIRST — before panels pack, to avoid the resize glitch
     x, y = root.winfo_x(), root.winfo_y()
     if is_prompt or is_notes:
         root.geometry(f"500x500+{x}+{y}")
     else:
         root.geometry(f"500x54+{x}+{y}")
+
+    toggle_prompt_panel(is_prompt)
+    toggle_notes_panel(is_notes)
+
+    # Hide main mic in NTS (it has its own orb in the note editor)
+    if is_notes:
+        btn.grid_remove()
+    else:
+        btn.grid()
+
+    # Hide lock button on PRO and NTS — only relevant for LIVE/BUF external field targeting
+    if is_prompt or is_notes:
+        lock_btn.grid_remove()
+    else:
+        lock_btn.grid()
     if is_prompt:
         mode_help.set("PROMPT")
         focus_status.set(" Dictate prompt")
@@ -2225,10 +2228,10 @@ def toggle_focus_lock():
     global focus_lock
     focus_lock = not focus_lock
     if focus_lock:
-        lock_btn.config(text="🔒", fg=TEXT)
+        _draw_lock(True)
         L("FOCUS LOCK ON  auto-stop on focus change disabled")
     else:
-        lock_btn.config(text="🔓", fg=MUTED)
+        _draw_lock(False)
         L("FOCUS LOCK OFF  auto-stop on focus change enabled")
 
 
@@ -2680,12 +2683,23 @@ def _btn_animate():
 _btn_draw("idle")
 btn.bind("<Button-1>", lambda e: start_record() if not recording else stop_record("STOP button"))
 
-lock_btn = tk.Button(
-    pill, text="🔓", command=toggle_focus_lock, width=2, height=1,
-    relief="flat", bd=0, font=("Segoe UI", 11), fg=MUTED, bg=BG,
-    activebackground="#27272a", activeforeground=TEXT, cursor="hand2"
+lock_btn = tk.Canvas(
+    pill, width=22, height=22, bg=BG, highlightthickness=0, bd=0, cursor="hand2"
 )
 lock_btn.grid(row=0, column=3, sticky="e", padx=(0, 2))
+
+def _draw_lock(locked):
+    lock_btn.delete("all")
+    col = TEXT if locked else MUTED
+    # shackle arc (top half of lock)
+    lock_btn.create_arc(6, 2, 16, 13, start=0, extent=180, outline=col, width=1.5, style="arc")
+    # body rectangle
+    lock_btn.create_rectangle(4, 10, 18, 20, outline=col, width=1.5)
+    # keyhole
+    lock_btn.create_oval(9, 13, 13, 17, outline=col, width=1.2)
+
+_draw_lock(False)
+lock_btn.bind("<Button-1>", lambda e: toggle_focus_lock())
 
 close_btn = tk.Button(
     pill, text="X", command=close_widget, width=2, height=1,
@@ -3071,13 +3085,13 @@ _notes_search_entry = tk.Entry(_nsb_inner, textvariable=_notes_search_var,
     insertbackground=_N["text_dim"],
     font=(_UI_FONT or "Segoe UI", 9), bd=0, highlightthickness=0)
 _notes_search_entry.pack(side="left", fill="x", expand=True, padx=(8, 4), ipady=4)
-_notes_search_entry.insert(0, "Search notes…")
+_notes_search_entry.insert(0, "Search notes...")
 _notes_search_entry.config(fg=_N["text_muted"])
 _notes_search_entry.bind("<FocusIn>",
     lambda e: _notes_search_entry.delete(0, "end")
-    if _notes_search_entry.get() == "Search notes…" else None)
+    if _notes_search_entry.get() == "Search notes..." else None)
 _notes_search_entry.bind("<FocusOut>",
-    lambda e: (_notes_search_entry.insert(0, "Search notes…")
+    lambda e: (_notes_search_entry.insert(0, "Search notes...")
                if not _notes_search_entry.get() else None))
 
 tk.Label(_nsb_inner, text="⌕", font=(_UI_FONT or "Segoe UI", 10),
@@ -3188,14 +3202,14 @@ def _notes_render_list():
     for w in _notes_scroll_frame.winfo_children():
         w.destroy()
     q = _notes_search_entry.get().strip().lower()
-    if q == "search notes…":
+    if q == "search notes...":
         q = ""
     filtered = [n for n in _notes_data
                 if q in n.get("title", "").lower() or q in n.get("text", "").lower()]
     # pinned first
     filtered.sort(key=lambda n: (0 if n.get("pinned") else 1))
     if not filtered:
-        tk.Label(_notes_scroll_frame, text="No notes yet — click + NEW NOTE",
+        tk.Label(_notes_scroll_frame, text="No notes yet -- click + NEW NOTE",
                  font=(_UI_FONT or "Segoe UI", 9),
                  fg=_N["text_dim"], bg=_N["panel_bg"]).pack(pady=20)
         return
@@ -3215,17 +3229,21 @@ def _notes_make_card(parent, note):
     ch = tk.Frame(card, bg=_N["card_bg"])
     ch.pack(fill="x")
 
-    del_lbl = tk.Label(ch, text="✕", font=(_UI_FONT or "Segoe UI", 8),
-                       fg=_N["del_fg"], bg=_N["card_bg"], cursor="hand2")
-    del_lbl.pack(side="right")
-    del_lbl.bind("<Button-1>", lambda e, n=note: _notes_delete(n))
+    del_cv = tk.Canvas(ch, width=14, height=14, bg=_N["card_bg"],
+                       highlightthickness=0, cursor="hand2")
+    del_cv.create_line(3, 3, 11, 11, fill=_N["del_fg"], width=1.5)
+    del_cv.create_line(11, 3, 3, 11, fill=_N["del_fg"], width=1.5)
+    del_cv.pack(side="right")
+    del_cv.bind("<Button-1>", lambda e, n=note: _notes_delete(n))
 
-    pin_lbl = tk.Label(ch, text="📌" if is_pinned else "📍",
-                       font=(_UI_FONT or "Segoe UI", 8),
-                       fg="#22c55e" if is_pinned else _N["del_fg"],
-                       bg=_N["card_bg"], cursor="hand2")
-    pin_lbl.pack(side="right", padx=(0, 4))
-    pin_lbl.bind("<Button-1>", lambda e, n=note: _notes_toggle_pin(n))
+    pin_color = "#22c55e" if is_pinned else _N["del_fg"]
+    pin_cv = tk.Canvas(ch, width=14, height=14, bg=_N["card_bg"],
+                       highlightthickness=0, cursor="hand2")
+    # Canvas pin: vertical line + diamond head
+    pin_cv.create_line(7, 7, 7, 13, fill=pin_color, width=1.5)
+    pin_cv.create_polygon(4, 2, 10, 2, 12, 7, 7, 9, 2, 7, fill=pin_color, outline="")
+    pin_cv.pack(side="right", padx=(0, 4))
+    pin_cv.bind("<Button-1>", lambda e, n=note: _notes_toggle_pin(n))
 
     ts = note.get("time") or note.get("updated_at", "")
     if ts and isinstance(ts, (int, float)):
@@ -3243,7 +3261,7 @@ def _notes_make_card(parent, note):
 
     preview = (note.get("text", "") or "").replace("\n", " ")
     if len(preview) > 85:
-        preview = preview[:82] + "…"
+        preview = preview[:82] + "..."
     text_lbl = tk.Label(card, text=preview,
                         font=(_UI_FONT or "Segoe UI", 9),
                         fg=_N["text_dim"], bg=_N["card_bg"],
@@ -3276,6 +3294,9 @@ def _notes_open_editor(note=None):
     dlg.configure(bg=BORDER)
     dlg.attributes("-topmost", True)
 
+    # Track this editor so screenshot can hide all open editors
+    _open_editor_windows.append(dlg)
+
     # Center over main widget — must happen before update_idletasks
     root.update_idletasks()
     rx, ry = root.winfo_x(), root.winfo_y()
@@ -3287,6 +3308,8 @@ def _notes_open_editor(note=None):
     _dlg_outer.pack(fill="both", expand=True)
 
     def _on_close():
+        if dlg in _open_editor_windows:
+            _open_editor_windows.remove(dlg)
         _notes_canvas.bind_all("<MouseWheel>", _notes_mousewheel)
         dlg.destroy()
 
@@ -3297,35 +3320,67 @@ def _notes_open_editor(note=None):
     hdr.pack(fill="x")
 
     def _save():
-        content = t_body.get("1.0", "end-1c").strip()
-        if not content or content == "Take a note…":
+        import re as _re
+        # Walk the text widget dump to collect text and image positions.
+        # Images are replaced with [IMG:N] markers in the saved text,
+        # and their base64 data stored in note["images"].
+        raw_parts = []
+        img_b64_list = []
+        img_idx = 0
+        for item in t_body.dump("1.0", "end", image=True, text=True):
+            kind, value, index = item
+            if kind == "text":
+                raw_parts.append(value)
+            elif kind == "image":
+                # Find the PhotoImage object that matches this image name
+                b64 = None
+                for ph in getattr(t_body, "_images", []):
+                    if str(ph) == value:
+                        b64 = getattr(ph, "_b64data", None)
+                        break
+                if b64:
+                    raw_parts.append(f"[IMG:{img_idx}]")
+                    img_b64_list.append(b64)
+                    img_idx += 1
+        content = "".join(raw_parts).strip()
+        if not content or content == "Take a note...":
             _on_close()
             return
         ts = _dt.datetime.now().strftime("%I:%M %p").lstrip("0")
+        record = {
+            "id":    int(_dt.datetime.now().timestamp()),
+            "title": content.split("\n")[0][:60],
+            "time":  ts,
+            "text":  content,
+        }
+        if img_b64_list:
+            record["images"] = img_b64_list
         if note:
-            note["title"] = content.split("\n")[0][:60]
-            note["text"]  = content
-            note["time"]  = ts
+            note.update(record)
+            note["id"] = note.get("id", record["id"])
         else:
-            _notes_data.insert(0, {
-                "id":    int(_dt.datetime.now().timestamp()),
-                "title": content.split("\n")[0][:60],
-                "time":  ts,
-                "text":  content,
-            })
+            _notes_data.insert(0, record)
         _notes_save()
         _notes_render_list()
         _on_close()
 
-    save_lbl = tk.Label(hdr, text="✓ Save", font=(_UI_FONT or "Segoe UI", 10, "bold"),
-                        fg="#0a0a0a", bg=_N["accent"], cursor="hand2")
-    save_lbl.pack(side="left")
-    save_lbl.bind("<Button-1>", lambda e: _save())
+    save_cv = tk.Canvas(hdr, width=24, height=24, bg=_N["accent"],
+                       highlightthickness=0, cursor="hand2")
+    save_cv.pack(side="left")
+    save_cv.create_line(6, 5, 18, 5, fill="#0a0a0a", width=1.5)
+    save_cv.create_line(6, 5, 6, 19, fill="#0a0a0a", width=1.5)
+    save_cv.create_line(18, 5, 18, 19, fill="#0a0a0a", width=1.5)
+    save_cv.create_line(6, 19, 18, 19, fill="#0a0a0a", width=1.5)
+    save_cv.create_rectangle(8, 6, 16, 11, outline="#0a0a0a", width=1.2)
+    save_cv.create_rectangle(9, 14, 15, 19, outline="#0a0a0a", width=1.2)
+    save_cv.bind("<Button-1>", lambda e: _save())
 
-    close_lbl = tk.Label(hdr, text="✕", font=(_UI_FONT or "Segoe UI", 11, "bold"),
-                         fg="#0a0a0a", bg=_N["accent"], cursor="hand2")
-    close_lbl.pack(side="right", padx=(6, 0))
-    close_lbl.bind("<Button-1>", lambda e: _on_close())
+    close_cv = tk.Canvas(hdr, width=24, height=24, bg=_N["accent"],
+                         highlightthickness=0, cursor="hand2")
+    close_cv.pack(side="right", padx=(6, 0))
+    close_cv.create_line(6, 6, 18, 18, fill="#0a0a0a", width=1.5)
+    close_cv.create_line(18, 6, 6, 18, fill="#0a0a0a", width=1.5)
+    close_cv.bind("<Button-1>", lambda e: _on_close())
 
     # Drag — bind on header and all children except interactive ones
     def _hdr_ds(e): dlg._dx = e.x_root - dlg.winfo_x(); dlg._dy = e.y_root - dlg.winfo_y()
@@ -3471,7 +3526,7 @@ def _notes_open_editor(note=None):
                                     nts_committed_count = commit_up_to
                                     def _append_progressive(t=batch):
                                         cur = t_body.get("1.0", "end-1c")
-                                        if cur in ("", "Take a note…"):
+                                        if cur in ("", "Take a note..."):
                                             t_body.delete("1.0", "end")
                                             t_body.config(fg=_N["text_main"])
                                             t_body.insert("1.0", t + " ")
@@ -3495,7 +3550,7 @@ def _notes_open_editor(note=None):
                                 if remainder:
                                     def _append_final(t=remainder):
                                         cur = t_body.get("1.0", "end-1c")
-                                        if cur in ("", "Take a note…"):
+                                        if cur in ("", "Take a note..."):
                                             t_body.delete("1.0", "end")
                                             t_body.config(fg=_N["text_main"])
                                             t_body.insert("1.0", t + " ")
@@ -3533,6 +3588,80 @@ def _notes_open_editor(note=None):
         _orig_on_close()
     dlg.protocol("WM_DELETE_WINDOW", _on_close)
 
+    # --- Formatting footer — must be packed BEFORE t_body so expand=True doesn't eat it ---
+    _FMT_FONT  = _UI_FONT or "Segoe UI"
+    _FTR_BG    = _N["panel_bg"]
+    _FTR_ICON  = "#94a3b8"
+    _FTR_HOVER = "#e2e8f0"
+    _FTR_SEP   = _N["divider"]
+    _BTN_SIZE  = 36
+
+    fmt_footer = tk.Frame(_dlg_outer, bg=_FTR_BG, height=44)
+    fmt_footer.pack(fill="x", side="bottom")
+    fmt_footer.pack_propagate(False)
+    tk.Frame(fmt_footer, bg=_FTR_SEP, height=1).pack(fill="x")
+    fmt_inner = tk.Frame(fmt_footer, bg=_FTR_BG)
+    fmt_inner.pack(fill="both", expand=True, padx=8)
+
+    def _make_fmt_btn(parent, draw_fn, command):
+        cv = tk.Canvas(parent, width=_BTN_SIZE, height=_BTN_SIZE,
+                       bg=_FTR_BG, highlightthickness=0, cursor="hand2")
+        cv.pack(side="left", padx=2, pady=4)
+        draw_fn(cv, _FTR_ICON)
+        cv.bind("<Enter>",    lambda e: (cv.delete("all"), draw_fn(cv, _FTR_HOVER)))
+        cv.bind("<Leave>",    lambda e: (cv.delete("all"), draw_fn(cv, _FTR_ICON)))
+        cv.bind("<Button-1>", lambda e: command())
+        return cv
+
+    def _draw_bold(cv, col):
+        cx, cy = _BTN_SIZE//2, _BTN_SIZE//2
+        cv.create_text(cx, cy, text="B", font=(_FMT_FONT, 13, "bold"), fill=col, anchor="center")
+    def _draw_italic(cv, col):
+        cx, cy = _BTN_SIZE//2, _BTN_SIZE//2
+        cv.create_text(cx, cy, text="I", font=(_FMT_FONT, 13, "italic"), fill=col, anchor="center")
+    def _draw_underline(cv, col):
+        cx, cy = _BTN_SIZE//2, _BTN_SIZE//2
+        cv.create_text(cx, cy, text="U", font=(_FMT_FONT, 13), fill=col, anchor="center")
+        cv.create_line(cx-6, cy+9, cx+6, cy+9, fill=col, width=1.5)
+    def _draw_strikethrough(cv, col):
+        cx, cy = _BTN_SIZE//2, _BTN_SIZE//2
+        cv.create_text(cx, cy, text="ab", font=(_FMT_FONT, 11), fill=col, anchor="center")
+        cv.create_line(cx-8, cy, cx+8, cy, fill=col, width=1.5)
+    def _draw_bullets(cv, col):
+        cx, cy = _BTN_SIZE//2, _BTN_SIZE//2
+        for dy in (-5, 0, 5):
+            cv.create_oval(cx-11, cy+dy-1, cx-8, cy+dy+2, fill=col, outline="")
+            cv.create_line(cx-5, cy+dy, cx+10, cy+dy, fill=col, width=1.5)
+    def _draw_image(cv, col):
+        cx, cy = _BTN_SIZE//2, _BTN_SIZE//2
+        cv.create_rectangle(cx-9, cy-7, cx+9, cy+7, outline=col, width=1.5)
+        cv.create_line(cx-7, cy+4, cx-2, cy-1, cx+3, cy+2, cx+7, cy-2, fill=col, width=1.2)
+        cv.create_oval(cx+4, cy-5, cx+7, cy-2, fill=col, outline="")
+
+    def _draw_screenshot(cv, col):
+        cx, cy = _BTN_SIZE//2, _BTN_SIZE//2
+        # Outer screen rectangle
+        cv.create_rectangle(cx-9, cy-7, cx+9, cy+6, outline=col, width=1.5)
+        # Crosshair
+        cv.create_line(cx, cy-4, cx, cy+3, fill=col, width=1.2)
+        cv.create_line(cx-4, cy, cx+4, cy, fill=col, width=1.2)
+        # Corner brackets top-left
+        cv.create_line(cx-9, cy-4, cx-9, cy-7, cx-5, cy-7, fill=col, width=1.5)
+        # Corner brackets bottom-right
+        cv.create_line(cx+9, cy+3, cx+9, cy+6, cx+5, cy+6, fill=col, width=1.5)
+
+    # Placeholder lambdas — real commands assigned after t_body is created
+    _fmt_cmds = [None, None, None, None, None, None, None]
+    _fmt_btns = [
+        _make_fmt_btn(fmt_inner, _draw_bold,          lambda: _fmt_cmds[0]()),
+        _make_fmt_btn(fmt_inner, _draw_italic,        lambda: _fmt_cmds[1]()),
+        _make_fmt_btn(fmt_inner, _draw_underline,     lambda: _fmt_cmds[2]()),
+        _make_fmt_btn(fmt_inner, _draw_strikethrough, lambda: _fmt_cmds[3]()),
+        _make_fmt_btn(fmt_inner, _draw_bullets,       lambda: _fmt_cmds[4]()),
+        _make_fmt_btn(fmt_inner, _draw_image,         lambda: _fmt_cmds[5]()),
+        _make_fmt_btn(fmt_inner, _draw_screenshot,    lambda: _fmt_cmds[6]()),
+    ]
+
     t_body = tk.Text(_dlg_outer, bg=_N["card_bg"], fg=_N["text_main"],
                      insertbackground=_N["text_dim"],
                      font=(_UI_FONT or "Segoe UI", 10), bd=0, relief="flat",
@@ -3540,17 +3669,241 @@ def _notes_open_editor(note=None):
                      selectbackground="#1e3a5f", selectforeground="#e2e8f0")
     t_body.pack(fill="both", expand=True)
 
-    _PH = "Take a note…"
+    # Configure formatting tags
+    t_body.tag_configure("bold",          font=(_FMT_FONT, 10, "bold"))
+    t_body.tag_configure("italic",        font=(_FMT_FONT, 10, "italic"))
+    t_body.tag_configure("underline",     font=(_FMT_FONT, 10), underline=True)
+    t_body.tag_configure("strikethrough", font=(_FMT_FONT, 10), overstrike=True)
+    t_body.tag_configure("bold_italic",   font=(_FMT_FONT, 10, "bold italic"))
+    t_body.tag_configure("bold_underline",     font=(_FMT_FONT, 10, "bold"), underline=True)
+    t_body.tag_configure("italic_underline",   font=(_FMT_FONT, 10, "italic"), underline=True)
+
+    def _fmt_toggle(tag):
+        try:
+            s, e2 = t_body.index("sel.first"), t_body.index("sel.last")
+        except tk.TclError:
+            return
+        if tag in t_body.tag_names(s):
+            t_body.tag_remove(tag, s, e2)
+        else:
+            t_body.tag_add(tag, s, e2)
+        t_body.focus_set()
+
+    def _fmt_bullets():
+        try:
+            sl = int(t_body.index("sel.first").split(".")[0])
+            el = int(t_body.index("sel.last").split(".")[0])
+        except tk.TclError:
+            sl = el = int(t_body.index("insert").split(".")[0])
+        for ln in range(sl, el + 1):
+            txt = t_body.get(f"{ln}.0", f"{ln}.end")
+            if txt.startswith("• "):
+                t_body.delete(f"{ln}.0", f"{ln}.2")
+            elif txt.startswith("•"):
+                t_body.delete(f"{ln}.0", f"{ln}.1")
+            else:
+                t_body.insert(f"{ln}.0", "• ")
+        t_body.focus_set()
+
+    def _fmt_image():
+        from tkinter import filedialog
+        from PIL import Image as _Img, ImageTk as _ITk
+        import base64, io
+        path = filedialog.askopenfilename(
+            parent=dlg, title="Insert image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.gif *.bmp *.webp"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            img = _Img.open(path).convert("RGBA")
+            if img.width > 360:
+                img = img.resize((360, int(img.height * 360 / img.width)), _Img.LANCZOS)
+            # Store PNG bytes as base64 on the photo object for serialization
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            b64 = base64.b64encode(buf.getvalue()).decode("ascii")
+            photo = _ITk.PhotoImage(img)
+            photo._b64data = b64  # attach for save serialization
+            if not hasattr(t_body, "_images"):
+                t_body._images = []
+            t_body._images.append(photo)
+            t_body.image_create("insert", image=photo, padx=4, pady=4)
+            t_body.focus_set()
+        except Exception as ex:
+            L("NOTES IMAGE INSERT ERROR: %s", ex)
+
+    # Wire up the deferred commands now that t_body exists
+    _fmt_cmds[0] = lambda: _fmt_toggle("bold")
+    _fmt_cmds[1] = lambda: _fmt_toggle("italic")
+    _fmt_cmds[2] = lambda: _fmt_toggle("underline")
+    _fmt_cmds[3] = lambda: _fmt_toggle("strikethrough")
+    _fmt_cmds[4] = _fmt_bullets
+    _fmt_cmds[5] = _fmt_image
+
+    def _fmt_screenshot():
+        """Hide ALL editor windows + main widget, rubber-band select, capture region."""
+        import base64, io, uuid, os as _os, datetime as _dt2
+        from PIL import ImageGrab, ImageTk as _ITk2
+
+        was_root_visible = root.state() != "withdrawn"
+
+        # Withdraw every open editor, not just this one
+        hidden_editors = [w for w in _open_editor_windows
+                          if w.winfo_exists() and w.state() != "withdrawn"]
+
+        def _restore_windows():
+            if was_root_visible:
+                root.deiconify()
+            for w in hidden_editors:
+                try: w.deiconify()
+                except Exception: pass
+            t_body.focus_set()
+
+        def _do_grab(box):
+            x1, y1, x2, y2 = box
+            if x2 - x1 < 4 or y2 - y1 < 4:
+                _restore_windows()
+                return
+            try:
+                img = ImageGrab.grab(bbox=(x1, y1, x2, y2), all_screens=True)
+                ts  = _dt2.datetime.now().strftime("%Y%m%d_%H%M%S")
+                uid = str(uuid.uuid4())[:8].upper()
+                fname     = f"GEMDIC_{ts}_{uid}.png"
+                dl        = _os.path.join(_os.path.expanduser("~"), "Downloads")
+                save_path = _os.path.join(dl, fname)
+                img.save(save_path, format="PNG")
+                L("SCREENSHOT SAVED: %s", save_path)
+                if img.width > 360:
+                    from PIL import Image as _PI
+                    rs = getattr(_PI, "LANCZOS", getattr(getattr(_PI, "Resampling", None), "LANCZOS", 1))
+                    img = img.resize((360, int(img.height * 360 / img.width)), rs)
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                b64   = base64.b64encode(buf.getvalue()).decode("ascii")
+                photo = _ITk2.PhotoImage(img)
+                photo._b64data = b64
+                if not hasattr(t_body, "_images"):
+                    t_body._images = []
+                t_body._images.append(photo)
+                _restore_windows()
+                # If the widget only has the placeholder, clear it first
+                if t_body.get("1.0", "end-1c") == _PH:
+                    t_body.delete("1.0", "end")
+                    t_body.config(fg=_N["text_main"])
+                t_body.image_create("insert", image=photo, padx=4, pady=4)
+                t_body.focus_set()
+            except Exception as ex:
+                L("SCREENSHOT GRAB ERROR: %s", ex)
+                _restore_windows()
+
+        def _show_overlay():
+            sw = root.winfo_screenwidth()
+            sh = root.winfo_screenheight()
+            overlay = tk.Toplevel()
+            overlay.overrideredirect(True)
+            overlay.attributes("-topmost", True)
+            overlay.geometry(f"{sw}x{sh}+0+0")
+            overlay.attributes("-alpha", 0.5)
+            overlay.configure(bg="#050510")
+            cv = tk.Canvas(overlay, bg="#050510", cursor="crosshair",
+                           highlightthickness=0)
+            cv.pack(fill="both", expand=True)
+            cv.create_text(sw//2, 30,
+                           text="Drag to select a region    |    ESC to cancel",
+                           fill="#f59e0b", font=("Segoe UI", 13, "bold"), anchor="center")
+            rect_id = [None]; shade_ids = []; start = [0, 0]; coords = [None]
+
+            def _clear():
+                if rect_id[0]: cv.delete(rect_id[0]); rect_id[0] = None
+                for s in shade_ids: cv.delete(s)
+                shade_ids.clear()
+
+            def _on_press(e):
+                start[0], start[1] = e.x, e.y; _clear()
+
+            def _on_drag(e):
+                _clear()
+                x0, y0, x1, y1 = start[0], start[1], e.x, e.y
+                rect_id[0] = cv.create_rectangle(x0, y0, x1, y1,
+                    outline="#f59e0b", width=3)
+                shade_ids.append(cv.create_rectangle(x0+3, y0+3, x1-3, y1-3,
+                    outline="#ffffff", width=1, dash=(6, 3)))
+                w, h = abs(x1-x0), abs(y1-y0)
+                lx = min(x0,x1)+w//2; ly = max(y0,y1)+18
+                shade_ids.append(cv.create_rectangle(lx-32, ly-10, lx+32, ly+10,
+                    fill="#1a1a2e", outline="#f59e0b", width=1))
+                shade_ids.append(cv.create_text(lx, ly, text=f"{w} x {h}",
+                    fill="#f59e0b", font=("Segoe UI", 9, "bold"), anchor="center"))
+
+            def _on_release(e):
+                coords[0] = (min(start[0],e.x), min(start[1],e.y),
+                             max(start[0],e.x), max(start[1],e.y))
+                overlay.destroy()
+                root.after(120, lambda: _do_grab(coords[0]))
+
+            def _on_escape(e):
+                overlay.destroy(); _restore_windows()
+
+            cv.bind("<ButtonPress-1>",   _on_press)
+            cv.bind("<B1-Motion>",       _on_drag)
+            cv.bind("<ButtonRelease-1>", _on_release)
+            overlay.bind("<Escape>",     _on_escape)
+            overlay.focus_force()
+
+        # Hide everything first, then schedule overlay via root's event loop
+        for w in hidden_editors:
+            try: w.withdraw()
+            except Exception: pass
+        if was_root_visible:
+            root.withdraw()
+        root.after(200, _show_overlay)
+
+    _fmt_cmds[6] = _fmt_screenshot
+
+    _PH = "Take a note..."
     def _ph_in(e):
-        if t_body.get("1.0", "end-1c") == _PH:
+        # Only clear if the widget contains ONLY the placeholder text (no images)
+        content = t_body.get("1.0", "end-1c")
+        has_images = bool(t_body.dump("1.0", "end", image=True))
+        if content == _PH and not has_images:
             t_body.delete("1.0", "end")
             t_body.config(fg=_N["text_main"])
     def _ph_out(e):
-        if not t_body.get("1.0", "end-1c").strip():
+        content = t_body.get("1.0", "end-1c").strip()
+        has_images = bool(t_body.dump("1.0", "end", image=True))
+        if not content and not has_images:
             t_body.insert("1.0", _PH)
             t_body.config(fg=_N["text_dim"])
     if note:
-        t_body.insert("1.0", note.get("text", ""))
+        saved_text = note.get("text", "")
+        saved_images = note.get("images", [])
+        if saved_images:
+            # Re-insert text with embedded images at [IMG:N] markers
+            import re as _re2, base64 as _b64, io as _io
+            from PIL import Image as _Img2, ImageTk as _ITk2
+            if not hasattr(t_body, "_images"):
+                t_body._images = []
+            parts = _re2.split(r"(\[IMG:\d+\])", saved_text)
+            for part in parts:
+                m = _re2.match(r"\[IMG:(\d+)\]", part)
+                if m:
+                    idx = int(m.group(1))
+                    if idx < len(saved_images):
+                        try:
+                            img_bytes = _b64.b64decode(saved_images[idx])
+                            img = _Img2.open(_io.BytesIO(img_bytes))
+                            photo = _ITk2.PhotoImage(img)
+                            photo._b64data = saved_images[idx]
+                            t_body._images.append(photo)
+                            t_body.image_create("end", image=photo, padx=4, pady=4)
+                        except Exception as ex:
+                            L("NOTES IMAGE RESTORE ERROR idx=%d: %s", idx, ex)
+                else:
+                    if part:
+                        t_body.insert("end", part)
+        else:
+            t_body.insert("1.0", saved_text)
     else:
         t_body.insert("1.0", _PH)
         t_body.config(fg=_N["text_dim"])
@@ -3621,12 +3974,12 @@ def _notes_open_editor(note=None):
             t_body.after(1, cmd)
 
         menu_items = [
-            ("⧉  Copy",  lambda: _do(lambda: t_body.event_generate("<<Copy>>")),  not has_sel),
-            ("✂  Cut",   lambda: _do(lambda: t_body.event_generate("<<Cut>>")),   not has_sel),
-            ("⧈  Paste", lambda: _do(lambda: t_body.event_generate("<<Paste>>")), not can_paste),
+            ("Copy",  lambda: _do(lambda: t_body.event_generate("<<Copy>>")),  not has_sel),
+            ("Cut",   lambda: _do(lambda: t_body.event_generate("<<Cut>>")),   not has_sel),
+            ("Paste", lambda: _do(lambda: t_body.event_generate("<<Paste>>")), not can_paste),
             None,
-            ("↩  Undo",  lambda: _do(lambda: t_body.edit_undo()), not can_undo),
-            ("↪  Redo",  lambda: _do(lambda: t_body.edit_redo()), not can_redo),
+            ("Undo",  lambda: _do(lambda: t_body.edit_undo()), not can_undo),
+            ("Redo",  lambda: _do(lambda: t_body.edit_redo()), not can_redo),
         ]
 
         win = tk.Toplevel(dlg)
@@ -3690,19 +4043,41 @@ def _notes_open_editor(note=None):
         t_body.yview_scroll(int(-1 * (e.delta / 120)), "units")
     dlg.bind_all("<MouseWheel>", _dlg_scroll)
 
-    # Resize grip — bottom-right corner
-    grip = tk.Label(_dlg_outer, text="⇲", font=(_UI_FONT or "Segoe UI", 9),
-                    fg=_N["text_dim"], bg=_N["card_bg"], cursor="size_nw_se")
-    grip.pack(side="bottom", anchor="e", padx=4, pady=2)
-    def _grip_ds(e):
-        dlg._gx = e.x_root; dlg._gy = e.y_root
-        dlg._gw = dlg.winfo_width(); dlg._gh = dlg.winfo_height()
-    def _grip_dm(e):
-        nw = max(300, dlg._gw + (e.x_root - dlg._gx))
-        nh = max(200, dlg._gh + (e.y_root - dlg._gy))
-        dlg.geometry(f"{nw}x{nh}")
-    grip.bind("<Button-1>", _grip_ds)
-    grip.bind("<B1-Motion>", _grip_dm)
+    # Resize grip — overlay the actual bottom-right corner of the Toplevel.
+    # The editor uses overrideredirect(), so Windows does not provide a native
+    # resize border. A child of fmt_footer can be covered by fmt_inner; placing
+    # the handle directly on dlg guarantees it remains the topmost resize target.
+    _RESIZE_GRIP = 30
+    grip = tk.Canvas(
+        dlg, width=_RESIZE_GRIP, height=_RESIZE_GRIP,
+        bg=_FTR_BG, highlightthickness=0, bd=0,
+        cursor="size_nw_se"
+    )
+    grip.place(relx=1.0, rely=1.0, anchor="se", x=-1, y=-1)
+
+    # Draw a clearly visible but compact diagonal resize affordance.
+    grip.create_line(8, 22, 22, 8, fill=_N["text_dim"], width=1.2)
+    grip.create_line(14, 22, 22, 14, fill=_N["text_dim"], width=1.2)
+    grip.create_line(20, 22, 22, 20, fill=_N["text_dim"], width=1.2)
+
+    def _grip_press(e):
+        dlg._resize_start_x = e.x_root
+        dlg._resize_start_y = e.y_root
+        dlg._resize_start_w = dlg.winfo_width()
+        dlg._resize_start_h = dlg.winfo_height()
+        return "break"
+
+    def _grip_drag(e):
+        dx = e.x_root - dlg._resize_start_x
+        dy = e.y_root - dlg._resize_start_y
+        nw = max(320, dlg._resize_start_w + dx)
+        nh = max(240, dlg._resize_start_h + dy)
+        dlg.geometry(f"{int(nw)}x{int(nh)}")
+        return "break"
+
+    grip.bind("<ButtonPress-1>", _grip_press)
+    grip.bind("<B1-Motion>", _grip_drag)
+    grip.bind("<ButtonRelease-1>", lambda e: "break")
 
     t_body.focus_set()
     if note:
