@@ -27,6 +27,12 @@ MODEL = "gemini-3.5-transcribe-live"
 PROMPT_MODEL = "models/gemini-3.5-flash-lite"   # text→text model for prompt rewriting
 PROMPT_FALLBACKS = ["models/gemini-3.5-flash", "models/gemini-2.5-flash-lite"]
 DEVICE = 1
+# Audio source: "mic" = microphone only, "loopback" = system audio only,
+# "both" = mic + system audio mixed together.
+AUDIO_SOURCE = "mic"
+# Transcription language. "auto" = let Gemini detect (may produce wrong langs).
+# Set to a BCP-47 code to lock the output language.
+TRANSCRIBE_LANG = "en-US"
 RATE_IN = 44100
 RATE_OUT = 16000
 BLOCK = 2205
@@ -149,8 +155,8 @@ def _conv_rms(data: bytes) -> float:
 
 
 class _ConvAudioEngine:
-    """Owns one PyAudio instance + both streams. Mirrors AudioEngine in the
-    proven standalone reference — single object, no separate playback thread."""
+    """Owns one PyAudio instance + both streams. Callback-based playback for
+    smooth real-time audio — same pattern as scr_test.py standalone."""
 
     def __init__(self, on_status, on_ai_rms, on_user_rms, on_caption):
         self.stop_event    = threading.Event()
@@ -164,8 +170,30 @@ class _ConvAudioEngine:
         self.on_caption    = on_caption
         self._ai_buf       = ""
         self._user_buf     = ""
+        self._consecutive_loud = 0
+        # Callback-based playback buffer
+        self._pcm_buf      = bytearray()
+        self._pcm_lock     = threading.Lock()
+        self._pb_speaking  = threading.Event()
+        self._interrupted  = threading.Event()  # drops incoming audio after barge-in
 
     def start_audio(self):
+        CB_FRAMES = 512
+
+        def _audio_cb(in_data, frame_count, time_info, status):
+            needed = frame_count * 2
+            with self._pcm_lock:
+                available = len(self._pcm_buf)
+                if available >= needed:
+                    chunk = bytes(self._pcm_buf[:needed])
+                    del self._pcm_buf[:needed]
+                elif available > 0:
+                    chunk = bytes(self._pcm_buf) + b"\x00" * (needed - available)
+                    del self._pcm_buf[:]
+                else:
+                    chunk = b"\x00" * needed
+            return (chunk, pyaudio.paContinue)
+
         self.input_stream = self.audio.open(
             format=pyaudio.paInt16, channels=1,
             rate=CONV_INPUT_RATE, input=True,
@@ -174,15 +202,33 @@ class _ConvAudioEngine:
         self.output_stream = self.audio.open(
             format=pyaudio.paInt16, channels=1,
             rate=CONV_OUTPUT_RATE, output=True,
+            frames_per_buffer=CB_FRAMES,
+            stream_callback=_audio_cb,
         )
+        self.output_stream.start_stream()
+
+    def queue_audio(self, pcm: bytes):
+        with self._pcm_lock:
+            self._pcm_buf.extend(pcm)
+        self._pb_speaking.set()
+
+    def interrupt_playback(self):
+        with self._pcm_lock:
+            self._pcm_buf.clear()
+        self._pb_speaking.clear()
+        self._interrupted.set()
 
     def close_audio(self):
-        for s in (self.input_stream, self.output_stream):
-            if s:
-                try: s.stop_stream()
-                except Exception: pass
-                try: s.close()
-                except Exception: pass
+        if self.input_stream:
+            try: self.input_stream.stop_stream()
+            except Exception: pass
+            try: self.input_stream.close()
+            except Exception: pass
+        if self.output_stream:
+            try: self.output_stream.stop_stream()
+            except Exception: pass
+            try: self.output_stream.close()
+            except Exception: pass
         self.input_stream = self.output_stream = None
         try: self.audio.terminate()
         except Exception: pass
@@ -195,20 +241,47 @@ class _ConvAudioEngine:
                     None, self.input_stream.read, CONV_CHUNK, False)
                 if not chunk:
                     continue
-                self.on_user_rms(min(_conv_rms(chunk) / 3500.0, 1.0))
-                await self.ws.send(json.dumps({
-                    "realtimeInput": {
-                        "audio": {
-                            "data": base64.b64encode(chunk).decode("ascii"),
+                rms = _conv_rms(chunk)
+                self.on_user_rms(min(rms / 3500.0, 1.0))
+
+                # Barge-in: suppress echo while Gemini speaks
+                if self._pb_speaking.is_set():
+                    if rms >= 480.0:
+                        self._consecutive_loud += 1
+                        L("CONV BARGE-IN rms=%.0f block=%d/%d", rms, self._consecutive_loud, 2)
+                        if self._consecutive_loud >= 2:
+                            L("CONV BARGE-IN TRIGGERED — interrupting playback")
+                            self.interrupt_playback()
+                            self._consecutive_loud = 0
+                            await self.ws.send(json.dumps({
+                                "realtimeInput": {"audio": {
+                                    "data": base64.b64encode(chunk).decode("ascii"),
+                                    "mimeType": "audio/pcm;rate=16000",
+                                }}
+                            }))
+                            continue
+                    else:
+                        self._consecutive_loud = 0
+                    # Send silence while Gemini speaks and user hasn't confirmed barge-in
+                    await self.ws.send(json.dumps({
+                        "realtimeInput": {"audio": {
+                            "data": base64.b64encode(b"\x00" * len(chunk)).decode("ascii"),
                             "mimeType": "audio/pcm;rate=16000",
-                        }
-                    }
+                        }}
+                    }))
+                    continue
+
+                self._consecutive_loud = 0
+                await self.ws.send(json.dumps({
+                    "realtimeInput": {"audio": {
+                        "data": base64.b64encode(chunk).decode("ascii"),
+                        "mimeType": "audio/pcm;rate=16000",
+                    }}
                 }))
             except Exception:
                 break
 
     async def receive_gemini(self):
-        loop = asyncio.get_running_loop()
         while not self.stop_event.is_set():
             try:
                 raw = await self.ws.recv()
@@ -223,33 +296,39 @@ class _ConvAudioEngine:
             for part in sc.get("modelTurn", {}).get("parts", []):
                 inline = part.get("inlineData")
                 if inline and inline.get("data"):
+                    if self._interrupted.is_set():
+                        continue  # drop chunks after barge-in until turnComplete
                     pcm = base64.b64decode(inline["data"])
                     self.on_ai_rms(min(_conv_rms(pcm) / 5000.0, 1.0))
                     self.on_status("speaking")
-                    if self.output_stream:
-                        await loop.run_in_executor(None, self.output_stream.write, pcm)
+                    self.queue_audio(pcm)
 
             out_text = sc.get("outputTranscription", {}).get("text", "")
             if out_text:
                 self._ai_buf += out_text
-                self.on_caption("ai", self._ai_buf)
+                L("CONV RX out=%r speaking=%s", out_text[:40], self._pb_speaking.is_set())
+                self.on_caption("ai", out_text)
 
             in_text = sc.get("inputTranscription", {}).get("text", "")
             if in_text:
-                self._user_buf += in_text
-                self.on_caption("user", self._user_buf)
+                L("CONV RX in=%r", in_text[:40])
+                # Note: native audio model echo — do not push as user caption
 
             if sc.get("turnComplete"):
                 self._ai_buf = ""
-                self._user_buf = ""
+                self._interrupted.clear()
                 self.on_ai_rms(0.0)
                 self.on_status("listening")
+                L("CONV RX turnComplete")
+                self.on_caption("__turn_end__", "")
 
             if sc.get("interrupted"):
+                self.interrupt_playback()
                 self._ai_buf = ""
-                self._user_buf = ""
                 self.on_ai_rms(0.0)
                 self.on_status("listening")
+                L("CONV RX interrupted")
+                self.on_caption("__turn_end__", "")
 
 
 def _conv_on_ai_rms(v):
@@ -287,7 +366,6 @@ async def _gemini_live_conv():
                 "setup": {
                     "model": CONV_MODEL,
                     "generationConfig": {"responseModalities": ["AUDIO"]},
-                    "inputAudioTranscription":  {},
                     "outputAudioTranscription": {},
                 }
             }))
@@ -304,11 +382,30 @@ async def _gemini_live_conv():
             )
             engine.ws = ws
             _conv_engine = engine
+            _conv_ai_buf_ref[0] = engine  # allow UI to reset buf on turn_end
             engine.start_audio()
             _conv_on_status("listening")
 
             mic_task = asyncio.create_task(engine.send_microphone())
             rx_task  = asyncio.create_task(engine.receive_gemini())
+
+            async def _conv_drain_monitor():
+                _empty_since = [0.0]
+                import time as _t
+                while _conv_is_connected and not engine.stop_event.is_set():
+                    await asyncio.sleep(0.06)
+                    with engine._pcm_lock:
+                        is_empty = len(engine._pcm_buf) == 0
+                    if is_empty and engine._pb_speaking.is_set():
+                        if _empty_since[0] == 0.0:
+                            _empty_since[0] = _t.time()
+                        elif _t.time() - _empty_since[0] > 0.35:
+                            engine._pb_speaking.clear()
+                            _empty_since[0] = 0.0
+                    else:
+                        _empty_since[0] = 0.0
+
+            drain_task = asyncio.create_task(_conv_drain_monitor())
 
             while _conv_is_connected and not engine.stop_event.is_set():
                 await asyncio.sleep(0.1)
@@ -316,6 +413,7 @@ async def _gemini_live_conv():
             engine.stop_event.set()
             mic_task.cancel()
             rx_task.cancel()
+            drain_task.cancel()
             engine.close_audio()
 
     except Exception as ex:
@@ -365,10 +463,490 @@ def _on_conv_ended():
     mode_live.config(state="normal")
     mode_buf.config(state="normal")
     mode_pro.config(state="normal")
-    try: mode_not.config(state="normal")
-    except Exception: pass
-    try: mode_conv.config(state="normal")
-    except Exception: pass
+    for _mb in (mode_not, mode_conv, mode_cap, mode_scr):
+        try: _mb.config(state="normal")
+        except Exception: pass
+
+# ---------------------------------------------------------------------------
+# SCR MODE — Screen-aware voice session with persistent chat log
+# ---------------------------------------------------------------------------
+SCR_MODEL        = "models/gemini-2.5-flash-native-audio-latest"
+SCR_INPUT_RATE   = 16000
+SCR_CHUNK        = 640        # 40 ms @ 16 kHz — smaller for responsive barge-in
+SCR_OUTPUT_RATE  = 24000
+SCR_FRAME_INTERVAL = 1.0      # seconds between capture attempts
+SCR_MIN_FRAME_GAP  = 8.0      # minimum seconds between two sent frames
+SCR_IDLE_FREEZE  = 3.0        # freeze captures after this many idle seconds
+SCR_HASH_THRESH  = 3          # max Hamming distance to consider "same frame"
+SCR_MAX_LONG_DIM = 768        # resize to this on longest side before encode
+SCR_TOKEN_WARN   = 80000      # log warning when session cumulative tokens exceed this
+SCR_BARGEIN_RMS  = 480.0      # RMS threshold to confirm user voice over speaker echo
+SCR_CONFIRM_BLOCKS = 2        # consecutive loud blocks required to trigger barge-in
+
+_scr_is_connected  = False
+_scr_engine        = None
+_scr_ai_level      = [0.0]
+_scr_user_level    = [0.0]
+_scr_session_tokens = [0]     # cumulative estimated image tokens this session
+_scr_frames_sent   = [0]
+
+
+class _ScrAudioEngine:
+    """Audio + screen frame engine for SCR mode.
+    Mic → Gemini Live (WebSocket) + periodic screen frames.
+    Gemini → speaker output + transcript callbacks."""
+
+    def __init__(self, on_status, on_ai_rms, on_user_rms, on_caption):
+        self.stop_event     = threading.Event()
+        self.audio          = pyaudio.PyAudio()
+        self.input_stream   = None
+        self.output_stream  = None
+        self.ws             = None
+        self.on_status      = on_status
+        self.on_ai_rms      = on_ai_rms
+        self.on_user_rms    = on_user_rms
+        self.on_caption     = on_caption
+        self._ai_buf        = ""
+        self._user_buf      = ""
+        self._last_phash    = None
+        self._frame_queue   = asyncio.Queue(maxsize=2)
+        self._ai_speaking_until = 0.0
+        self._consecutive_loud = 0   # barge-in confirmation counter
+        self._last_frame_sent  = 0.0 # timestamp of last successfully sent frame
+        # Callback-based playback buffer (same pattern as scr_test.py standalone)
+        self._pcm_buf       = bytearray()
+        self._pcm_lock      = threading.Lock()
+        self._pb_speaking   = threading.Event()   # True while buffer has audio
+        self._interrupted   = threading.Event()   # drops incoming audio after barge-in
+        self._monitor_task  = None                # asyncio task watching drain
+
+    def start_audio(self):
+        CB_FRAMES = 512  # callback buffer size
+        BYTES_PER_FRAME = 2
+
+        def _audio_cb(in_data, frame_count, time_info, status):
+            needed = frame_count * BYTES_PER_FRAME
+            with self._pcm_lock:
+                available = len(self._pcm_buf)
+                if available >= needed:
+                    chunk = bytes(self._pcm_buf[:needed])
+                    del self._pcm_buf[:needed]
+                elif available > 0:
+                    chunk = bytes(self._pcm_buf) + b"\x00" * (needed - available)
+                    del self._pcm_buf[:]
+                else:
+                    chunk = b"\x00" * needed
+            return (chunk, pyaudio.paContinue)
+
+        self.input_stream = self.audio.open(
+            format=pyaudio.paInt16, channels=1,
+            rate=SCR_INPUT_RATE, input=True,
+            frames_per_buffer=SCR_CHUNK,
+        )
+        self.output_stream = self.audio.open(
+            format=pyaudio.paInt16, channels=1,
+            rate=SCR_OUTPUT_RATE, output=True,
+            frames_per_buffer=CB_FRAMES,
+            stream_callback=_audio_cb,
+        )
+        self.output_stream.start_stream()
+
+    def queue_audio(self, pcm: bytes):
+        with self._pcm_lock:
+            self._pcm_buf.extend(pcm)
+        self._pb_speaking.set()
+
+    def interrupt_playback(self):
+        with self._pcm_lock:
+            self._pcm_buf.clear()
+        self._pb_speaking.clear()
+
+    def close_audio(self):
+        if self.input_stream:
+            try: self.input_stream.stop_stream()
+            except Exception: pass
+            try: self.input_stream.close()
+            except Exception: pass
+        if self.output_stream:
+            try: self.output_stream.stop_stream()
+            except Exception: pass
+            try: self.output_stream.close()
+            except Exception: pass
+        self.input_stream = self.output_stream = None
+        try: self.audio.terminate()
+        except Exception: pass
+
+    def capture_screen_thread(self):
+        """Runs in a daemon thread. Captures screen, hashes, resizes, enqueues."""
+        try:
+            import mss, mss.tools
+            import imagehash
+            from PIL import Image as _PILImage
+            import io, time as _time
+
+            sct = mss.mss()
+            monitor = sct.monitors[0]  # all monitors combined
+            L("SCR CAPTURE THREAD STARTED monitor=%r", monitor)
+
+            while not self.stop_event.is_set():
+                _time.sleep(SCR_FRAME_INTERVAL)
+                if self.stop_event.is_set():
+                    break
+
+                # Activity gate — freeze if user has been idle
+                idle_s = get_idle_seconds()
+                if idle_s >= SCR_IDLE_FREEZE:
+                    L("SCR FRAME SKIPPED idle=%.1fs", idle_s)
+                    continue
+
+                # Capture
+                try:
+                    raw = sct.grab(monitor)
+                    img = _PILImage.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+                except Exception as e:
+                    L("SCR CAPTURE ERROR: %s", e)
+                    continue
+
+                # Perceptual hash on 64×64 grayscale
+                try:
+                    small = img.convert("L").resize((64, 64))
+                    ph = imagehash.phash(small)
+                    if self._last_phash is not None:
+                        dist = ph - self._last_phash
+                        if dist < SCR_HASH_THRESH:
+                            continue  # visually identical — skip
+                    self._last_phash = ph
+                except Exception as e:
+                    L("SCR HASH ERROR: %s", e)
+
+                # Resize to max 768px on longest side
+                w, h = img.size
+                scale = SCR_MAX_LONG_DIM / max(w, h)
+                if scale < 1.0:
+                    img = img.resize((int(w * scale), int(h * scale)),
+                                     _PILImage.LANCZOS)
+
+                # Encode JPEG. Live API realtime video frames are individual
+                # JPEG/PNG images; JPEG is used here for compact, predictable payloads.
+                buf = io.BytesIO()
+                img.save(buf, format="JPEG", quality=55, optimize=True)
+                jpeg_bytes = buf.getvalue()
+                kb = len(jpeg_bytes) / 1024
+
+                # Drop oldest if queue full — never backlog
+                if self._frame_queue.full():
+                    try: self._frame_queue.get_nowait()
+                    except Exception: pass
+
+                try:
+                    self._frame_queue.put_nowait((jpeg_bytes, kb))
+                except Exception:
+                    pass
+
+        except Exception:
+            L("SCR CAPTURE THREAD FATAL\n%s", traceback.format_exc())
+
+    async def send_microphone(self):
+        loop = asyncio.get_running_loop()
+        while not self.stop_event.is_set():
+            try:
+                chunk = await loop.run_in_executor(
+                    None, self.input_stream.read, SCR_CHUNK, False)
+                if not chunk:
+                    continue
+                rms = _conv_rms(chunk)
+                self.on_user_rms(min(rms / 3500.0, 1.0))
+
+                # ── Barge-in: suppress echo while Gemini speaks ─────────────
+                if self._pb_speaking.is_set():
+                    if rms >= SCR_BARGEIN_RMS:
+                        self._consecutive_loud += 1
+                        if self._consecutive_loud >= SCR_CONFIRM_BLOCKS:
+                            # Confirmed user voice — interrupt Gemini
+                            self.interrupt_playback()
+                            self._consecutive_loud = 0
+                            # Send the real chunk so Gemini hears the barge-in
+                            await self.ws.send(json.dumps({
+                                "realtimeInput": {
+                                    "audio": {
+                                        "data": base64.b64encode(chunk).decode("ascii"),
+                                        "mimeType": "audio/pcm;rate=16000",
+                                    }
+                                }
+                            }))
+                        # Keep counting; send silence to avoid echo feedback
+                        await self.ws.send(json.dumps({
+                            "realtimeInput": {
+                                "audio": {
+                                    "data": base64.b64encode(b"\x00" * len(chunk)).decode("ascii"),
+                                    "mimeType": "audio/pcm;rate=16000",
+                                }
+                            }
+                        }))
+                        continue
+                    else:
+                        self._consecutive_loud = 0
+                        # Send silence while Gemini talks and user is quiet
+                        await self.ws.send(json.dumps({
+                            "realtimeInput": {
+                                "audio": {
+                                    "data": base64.b64encode(b"\x00" * len(chunk)).decode("ascii"),
+                                    "mimeType": "audio/pcm;rate=16000",
+                                }
+                            }
+                        }))
+                        continue
+
+                # ── Normal send when Gemini is not speaking ─────────────────
+                self._consecutive_loud = 0
+                await self.ws.send(json.dumps({
+                    "realtimeInput": {
+                        "audio": {
+                            "data": base64.b64encode(chunk).decode("ascii"),
+                            "mimeType": "audio/pcm;rate=16000",
+                        }
+                    }
+                }))
+            except Exception:
+                break
+
+    async def send_frames(self):
+        """Drains frame queue and sends each as an inline JPEG image to Gemini."""
+        import time as _t
+        while not self.stop_event.is_set():
+            try:
+                jpeg_bytes, kb = await asyncio.wait_for(
+                    self._frame_queue.get(), timeout=0.5)
+            except (asyncio.TimeoutError, Exception):
+                continue
+
+            # Enforce minimum gap between sent frames
+            now = _t.time()
+            if now - self._last_frame_sent < SCR_MIN_FRAME_GAP:
+                continue
+
+            try:
+                encoded = base64.b64encode(jpeg_bytes).decode("ascii")
+                await self.ws.send(json.dumps({
+                    "realtimeInput": {
+                        "video": {
+                            "data": encoded,
+                            "mimeType": "image/jpeg",
+                        }
+                    }
+                }))
+                self._last_frame_sent = _t.time()
+                _scr_frames_sent[0] += 1
+                est_tokens = 258
+                _scr_session_tokens[0] += est_tokens
+                L("SCR FRAME SENT frame=%d size=%.1fKB ~tokens=%d session_total=%d",
+                  _scr_frames_sent[0], kb, est_tokens, _scr_session_tokens[0])
+                if _scr_session_tokens[0] >= SCR_TOKEN_WARN:
+                    L("SCR TOKEN WARNING session_tokens=%d threshold=%d",
+                      _scr_session_tokens[0], SCR_TOKEN_WARN)
+            except Exception as e:
+                L("SCR FRAME SEND ERROR: %s", e)
+
+    async def receive_gemini(self):
+        while not self.stop_event.is_set():
+            try:
+                raw = await self.ws.recv()
+                msg = json.loads(raw)
+            except Exception:
+                break
+
+            sc = msg.get("serverContent")
+            if not sc:
+                continue
+
+            for part in sc.get("modelTurn", {}).get("parts", []):
+                inline = part.get("inlineData")
+                if inline and inline.get("data"):
+                    pcm = base64.b64decode(inline["data"])
+                    self.on_ai_rms(min(_conv_rms(pcm) / 5000.0, 1.0))
+                    self.on_status("speaking")
+                    import time as _t
+                    chunk_secs = len(pcm) / (SCR_OUTPUT_RATE * 2)
+                    self._ai_speaking_until = max(
+                        self._ai_speaking_until,
+                        _t.time() + chunk_secs + 5.0
+                    )
+                    self.queue_audio(pcm)
+
+            out_text = sc.get("outputTranscription", {}).get("text", "")
+            if out_text:
+                self._ai_buf += out_text
+                L("SCR RX out_text=%r", out_text[:60])
+                self.on_caption("ai_chunk", out_text)
+
+            in_text = sc.get("inputTranscription", {}).get("text", "")
+            if in_text:
+                L("SCR RX in_text=%r", in_text[:60])
+                self.on_caption("user_chunk", in_text)
+
+            if sc.get("turnComplete"):
+                self._ai_buf = ""
+                self._ai_speaking_until = 0.0
+                self.on_ai_rms(0.0)
+                self.on_status("listening")
+                self.on_caption("__turn_end__", "")
+
+            if sc.get("interrupted"):
+                self.interrupt_playback()
+                self._ai_buf = ""
+                self._ai_speaking_until = 0.0
+                self.on_ai_rms(0.0)
+                self.on_status("listening")
+                self.on_caption("__turn_end__", "")
+
+
+def _scr_on_ai_rms(v):
+    _scr_ai_level[0] = max(_scr_ai_level[0], v)
+
+def _scr_on_user_rms(v):
+    _scr_user_level[0] = max(_scr_user_level[0], v)
+
+def _scr_on_status(status):
+    root.after(0, _scr_set_ui_status, status)
+
+def _scr_on_caption(speaker, text):
+    L("SCR CAPTION speaker=%r text=%r", speaker, text[:60] if text else "")
+    root.after(0, _scr_push_message, speaker, text)
+
+
+def _run_scr_loop():
+    lp = asyncio.new_event_loop()
+    asyncio.set_event_loop(lp)
+    lp.run_until_complete(_gemini_live_scr())
+
+
+async def _gemini_live_scr():
+    global _scr_is_connected, _scr_engine
+    key = os.environ.get("GEMINI_API_KEY")
+    url = CONV_WS_URL + f"?key={key}"
+    try:
+        async with _conv_ws.connect(
+            url, max_size=None, ping_interval=20, ping_timeout=20
+        ) as ws:
+            await ws.send(json.dumps({
+                "setup": {
+                    "model": SCR_MODEL,
+                    "generationConfig": {"responseModalities": ["AUDIO"]},
+                    "inputAudioTranscription": {},
+                    "outputAudioTranscription": {},
+                    "systemInstruction": {
+                        "parts": [{"text": (
+                            "You are a silent screen assistant. "
+                            "IMPORTANT: Do NOT speak unless the user explicitly asks you a question. "
+                            "Do NOT narrate or comment on screen changes proactively. "
+                            "Wait silently for the user to ask something. "
+                            "When asked, answer concisely based on what you see on their screen."
+                        )}]
+                    },
+                }
+            }))
+            resp = json.loads(await ws.recv())
+            if "setupComplete" not in resp:
+                _scr_on_status("error")
+                L("SCR SETUP FAILED: %r", resp)
+                return
+
+            engine = _ScrAudioEngine(
+                on_status   = _scr_on_status,
+                on_ai_rms   = _scr_on_ai_rms,
+                on_user_rms = _scr_on_user_rms,
+                on_caption  = _scr_on_caption,
+            )
+            engine.ws = ws
+            _scr_engine = engine
+            _scr_frames_sent[0] = 0
+            _scr_session_tokens[0] = 0
+            engine.start_audio()
+            _scr_on_status("listening")
+
+            # Screen capture in daemon thread
+            cap_thread = threading.Thread(
+                target=engine.capture_screen_thread, daemon=True)
+            cap_thread.start()
+
+            mic_task   = asyncio.create_task(engine.send_microphone())
+            frame_task = asyncio.create_task(engine.send_frames())
+            rx_task    = asyncio.create_task(engine.receive_gemini())
+
+            async def _drain_monitor():
+                _empty_since = [0.0]
+                import time as _t
+                while _scr_is_connected and not engine.stop_event.is_set():
+                    await asyncio.sleep(0.06)
+                    with engine._pcm_lock:
+                        is_empty = len(engine._pcm_buf) == 0
+                    if is_empty and engine._pb_speaking.is_set():
+                        if _empty_since[0] == 0.0:
+                            _empty_since[0] = _t.time()
+                        elif _t.time() - _empty_since[0] > 0.35:
+                            engine._pb_speaking.clear()
+                            _empty_since[0] = 0.0
+                    else:
+                        _empty_since[0] = 0.0
+
+            drain_task = asyncio.create_task(_drain_monitor())
+
+            while _scr_is_connected and not engine.stop_event.is_set():
+                await asyncio.sleep(0.1)
+
+            engine.stop_event.set()
+            for t in (mic_task, frame_task, rx_task, drain_task):
+                t.cancel()
+            engine.close_audio()
+            L("SCR SESSION END frames=%d tokens=%d",
+              _scr_frames_sent[0], _scr_session_tokens[0])
+
+    except Exception as ex:
+        L("SCR SESSION ERROR: %s\n%s", ex, traceback.format_exc())
+        _scr_on_status("error")
+        root.after(0, _scr_push_message, "ai", f"Error: {str(ex)[:80]}")
+    finally:
+        _scr_is_connected = False
+        root.after(0, _on_scr_ended)
+
+
+def start_scr():
+    global _scr_is_connected, _scr_engine
+    if _scr_is_connected:
+        return
+    if not os.environ.get("GEMINI_API_KEY"):
+        focus_status.set("GEMINI_API_KEY missing")
+        return
+    _scr_is_connected = True
+    _scr_ai_level[0]   = 0.0
+    _scr_user_level[0] = 0.0
+    root.after(0, _scr_set_ui_status, "connecting")
+    root.after(0, _scr_clear_chat)
+    threading.Thread(target=_run_scr_loop, daemon=True).start()
+    L("SCR SESSION STARTED")
+
+
+def stop_scr():
+    global _scr_is_connected
+    if not _scr_is_connected:
+        return
+    _scr_is_connected = False
+    if _scr_engine:
+        _scr_engine.stop_event.set()
+    root.after(0, _scr_set_ui_status, "stopped")
+    L("SCR SESSION STOPPED")
+
+
+def _on_scr_ended():
+    global _scr_engine
+    _scr_engine = None
+    _scr_ai_level[0]   = 0.0
+    _scr_user_level[0] = 0.0
+    _scr_set_ui_status("stopped")
+    for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv, mode_cap, mode_scr):
+        try: _mb.config(state="normal")
+        except Exception: pass
+
 
 # Notes
 NOTES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "notes.json")
@@ -823,7 +1401,7 @@ def update_focus_tracking():
             # from falsely killing the session.
             # When focus_lock is ON, skip auto-stop entirely — the user wants
             # to stay connected to the captured field across window switches.
-            if focus_lock:
+            if focus_lock or mode == "captions":
                 _focus_change_count = 0
             elif u and u.get("ok") and is_editable_uia(u) and not is_widget_foreground(top):
                 if not focus_is_same(recording_focus, current):
@@ -1217,6 +1795,10 @@ def insert_live_final(text):
     if not text or not text.strip():
         return False, "empty final text"
 
+    # CAPTIONS mode: output goes only to captions panel — never paste to external field
+    if mode == "captions":
+        return True, "captions mode — display only"
+
     # PROMPT mode: land transcription in the widget textbox, not an external field
     if prompt_mode_active:
         global _prompt_confirmed_text
@@ -1321,6 +1903,21 @@ def mic_cb(indata, frames, time_info, status):
         L("MIC CALLBACK ERROR\n%s", traceback.format_exc())
 
 
+def _get_wasapi_loopback_device():
+    """Return loopback recorder info using soundcard (WASAPI loopback on Windows).
+    Returns (loopback_mic_obj, samplerate) or (None, RATE_IN) if unavailable."""
+    try:
+        import soundcard as sc
+        default_spk = sc.default_speaker()
+        lb = sc.get_microphone(default_spk.id, include_loopback=True)
+        rate = RATE_IN  # we'll resample from 48000 if needed
+        L("WASAPI LOOPBACK device=%r name=%r", default_spk.id, lb.name)
+        return lb, rate
+    except Exception as e:
+        L("WASAPI LOOPBACK UNAVAILABLE: %s", e)
+        return None, RATE_IN
+
+
 def normalize_transcript_chunks(chunks):
     parts = [str(x).strip() for x in chunks if str(x).strip()]
     if not parts:
@@ -1359,9 +1956,14 @@ def _do_progressive_paste(batch):
     needed focus restore. No clipboard restore either — the original is restored
     once by insert_live_final after the VAD turn completes.
     In PROMPT mode there is no external target — progressive words are shown live
-    in the prompt textbox instead of being pasted via clipboard."""
+    in the prompt textbox instead of being pasted via clipboard.
+    In CAPTIONS mode output goes only to the captions panel — never pasted."""
     global _progressive_paste_busy
     try:
+        if mode == "captions":
+            # CAP mode: captions already shown via update_live_transcript — no paste
+            return
+
         if prompt_mode_active:
             # Show progressive words live in the prompt textbox.
             # Render: confirmed turns so far + all words committed this turn so far.
@@ -1410,7 +2012,9 @@ async def record_once(live_mode):
     # dictation. STOP uses audio_stream_end to flush the final active turn.
     cfg = types.LiveConnectConfig(
         response_modalities=["TEXT"],
-        input_audio_transcription=types.AudioTranscriptionConfig(language_codes=[]),
+        input_audio_transcription=types.AudioTranscriptionConfig(
+            language_codes=[] if TRANSCRIBE_LANG == "auto" else [TRANSCRIBE_LANG]
+        ),
     )
 
     pieces = []
@@ -1562,28 +2166,154 @@ async def record_once(live_mode):
             # Automatic VAD is enabled, so no manual activity_start is needed.
             L("AUTOMATIC VAD ACTIVE")
 
-            with sd.InputStream(
-                device=DEVICE,
-                samplerate=RATE_IN,
-                channels=1,
-                dtype="int16",
-                blocksize=BLOCK,
-                callback=mic_cb,
-            ):
-                L("MIC STREAM OPEN mode=%s", "LIVE" if live_mode else "BUFFERED")
-                while recording:
+            # ── Audio source selection ────────────────────────────────────
+            # AUDIO_SOURCE: "mic" | "loopback" | "both"
+            # loopback uses soundcard WASAPI loopback — captures exactly what
+            # you hear (headphones/speakers, whichever is the default output).
+
+            _lb_stop_evt = threading.Event()
+
+            def _loopback_thread(lb_mic, lb_q, stop_evt, numframes=BLOCK):
+                """Blocking soundcard loopback reader running in a daemon thread."""
+                try:
+                    native_rate = 48000
+                    with lb_mic.recorder(samplerate=native_rate, channels=1, blocksize=numframes) as rec:
+                        L("LOOPBACK THREAD STARTED rate=%d", native_rate)
+                        from math import gcd as _gcd
+                        g = _gcd(native_rate, RATE_IN)
+                        up, down = RATE_IN // g, native_rate // g
+                        while not stop_evt.is_set():
+                            data = rec.record(numframes=numframes)
+                            mono_f = data[:, 0]  # float32 in [-1, 1]
+                            if native_rate != RATE_IN:
+                                mono_f = resample_poly(mono_f, up, down)
+                            mono = np.clip(mono_f * 32767, -32768, 32767).astype(np.int16)
+                            try: lb_q.put_nowait(mono)
+                            except queue.Full: pass
+                except Exception:
+                    L("LOOPBACK THREAD ERROR\n%s", traceback.format_exc())
+
+            _lb_mix_q = queue.Queue(maxsize=300)
+
+            def _mix_cb(indata, frames, time_info, status):
+                """Mic callback for 'both' mode — mixes with latest loopback block."""
+                try:
+                    if status:
+                        L("MIC STATUS: %s", status)
+                    mic_block = indata[:, 0].copy().astype(np.float32)
                     try:
-                        x = await asyncio.to_thread(q.get, True, 0.1)
+                        lb_block = _lb_mix_q.get_nowait().astype(np.float32)
+                        if len(lb_block) > len(mic_block):
+                            lb_block = lb_block[:len(mic_block)]
+                        elif len(lb_block) < len(mic_block):
+                            lb_block = np.pad(lb_block, (0, len(mic_block) - len(lb_block)))
+                        mixed = np.clip((mic_block + lb_block) * 0.5, -32768, 32767).astype(np.int16)
                     except queue.Empty:
-                        continue
-                    y = resample_poly(x, RATE_OUT, RATE_IN).astype(np.int16)
-                    payload = y.tobytes()
-                    await session.send_realtime_input(
-                        audio=types.Blob(data=payload, mime_type="audio/pcm;rate=16000")
-                    )
-                    audio_sent += 1
-                    if audio_sent == 1 or audio_sent % 20 == 0:
-                        L("AUDIO SENT block=%d bytes=%d queue=%d", audio_sent, len(payload), q.qsize())
+                        mixed = mic_block.astype(np.int16)
+                    try:
+                        _btn_rms[0] = min(1.0, float(np.sqrt(np.mean(mixed.astype(np.float32) ** 2))) / 32768.0)
+                    except Exception:
+                        pass
+                    try: q.put_nowait(mixed)
+                    except queue.Full: pass
+                except Exception:
+                    L("MIX CB ERROR\n%s", traceback.format_exc())
+
+            def _loopback_only_thread(lb_mic, stop_evt, numframes=BLOCK):
+                """Loopback-only: feeds directly into q."""
+                try:
+                    native_rate = 48000
+                    with lb_mic.recorder(samplerate=native_rate, channels=1, blocksize=numframes) as rec:
+                        L("LOOPBACK-ONLY THREAD STARTED rate=%d", native_rate)
+                        from math import gcd as _gcd
+                        g = _gcd(native_rate, RATE_IN)
+                        up, down = RATE_IN // g, native_rate // g
+                        while not stop_evt.is_set():
+                            data = rec.record(numframes=numframes)
+                            mono_f = data[:, 0]
+                            if native_rate != RATE_IN:
+                                mono_f = resample_poly(mono_f, up, down)
+                            mono = np.clip(mono_f * 32767, -32768, 32767).astype(np.int16)
+                            try:
+                                _btn_rms[0] = min(1.0, float(np.sqrt(np.mean(mono_f ** 2))))
+                            except Exception:
+                                pass
+                            try: q.put_nowait(mono)
+                            except queue.Full: pass
+                except Exception:
+                    L("LOOPBACK-ONLY THREAD ERROR\n%s", traceback.format_exc())
+
+            src = AUDIO_SOURCE
+            lb_mic, _lb_rate = _get_wasapi_loopback_device()
+            lb_ok = lb_mic is not None
+
+            if src == "loopback" and lb_ok:
+                _lb_stop_evt.clear()
+                lb_t = threading.Thread(target=_loopback_only_thread, args=(lb_mic, _lb_stop_evt), daemon=True)
+                lb_t.start()
+                L("STREAM OPEN src=loopback mode=%s", "LIVE" if live_mode else "BUFFERED")
+                try:
+                    while recording:
+                        try:
+                            x = await asyncio.to_thread(q.get, True, 0.1)
+                        except queue.Empty:
+                            continue
+                        y = resample_poly(x, RATE_OUT, RATE_IN).astype(np.int16)
+                        payload = y.tobytes()
+                        await session.send_realtime_input(
+                            audio=types.Blob(data=payload, mime_type="audio/pcm;rate=16000")
+                        )
+                        audio_sent += 1
+                        if audio_sent == 1 or audio_sent % 20 == 0:
+                            L("AUDIO SENT block=%d bytes=%d queue=%d", audio_sent, len(payload), q.qsize())
+                finally:
+                    _lb_stop_evt.set()
+
+            elif src == "both" and lb_ok:
+                _lb_stop_evt.clear()
+                lb_t = threading.Thread(target=_loopback_thread, args=(lb_mic, _lb_mix_q, _lb_stop_evt), daemon=True)
+                lb_t.start()
+                with sd.InputStream(
+                    device=DEVICE, samplerate=RATE_IN, channels=1, dtype="int16",
+                    blocksize=BLOCK, callback=_mix_cb,
+                ):
+                    L("STREAM OPEN src=both mode=%s", "LIVE" if live_mode else "BUFFERED")
+                    try:
+                        while recording:
+                            try:
+                                x = await asyncio.to_thread(q.get, True, 0.1)
+                            except queue.Empty:
+                                continue
+                            y = resample_poly(x, RATE_OUT, RATE_IN).astype(np.int16)
+                            payload = y.tobytes()
+                            await session.send_realtime_input(
+                                audio=types.Blob(data=payload, mime_type="audio/pcm;rate=16000")
+                            )
+                            audio_sent += 1
+                            if audio_sent == 1 or audio_sent % 20 == 0:
+                                L("AUDIO SENT block=%d bytes=%d queue=%d", audio_sent, len(payload), q.qsize())
+                    finally:
+                        _lb_stop_evt.set()
+
+            else:
+                with sd.InputStream(
+                    device=DEVICE, samplerate=RATE_IN, channels=1, dtype="int16",
+                    blocksize=BLOCK, callback=mic_cb,
+                ):
+                    L("STREAM OPEN src=mic mode=%s", "LIVE" if live_mode else "BUFFERED")
+                    while recording:
+                        try:
+                            x = await asyncio.to_thread(q.get, True, 0.1)
+                        except queue.Empty:
+                            continue
+                        y = resample_poly(x, RATE_OUT, RATE_IN).astype(np.int16)
+                        payload = y.tobytes()
+                        await session.send_realtime_input(
+                            audio=types.Blob(data=payload, mime_type="audio/pcm;rate=16000")
+                        )
+                        audio_sent += 1
+                        if audio_sent == 1 or audio_sent % 20 == 0:
+                            L("AUDIO SENT block=%d bytes=%d queue=%d", audio_sent, len(payload), q.qsize())
 
             L("MIC STREAM CLOSED audio_blocks=%d", audio_sent)
             await session.send_realtime_input(audio_stream_end=True)
@@ -1652,6 +2382,9 @@ def update_live_transcript(text, final):
         transcript_preview.set("FINAL: " + text[-650:])
     else:
         transcript_preview.set("LIVE: " + text[-650:])
+    # Feed captions panel if active
+    if mode == "captions" and text.strip():
+        _captions_append(text, final)
 
 
 PROMPT_SYSTEM = (
@@ -2123,6 +2856,31 @@ def toggle_notes_panel(show):
         _notes_canvas.unbind_all("<MouseWheel>")
 
 
+def toggle_captions_panel(show):
+    """Show/hide the captions panel below the pill."""
+    if show:
+        prompt_panel.pack_forget()
+        notes_panel.pack_forget()
+        captions_panel.pack(fill="x", padx=4, pady=(0, 4))
+        root.after(100, _cap_schedule_fade)   # start fade timer after layout settles
+    else:
+        _cap_cancel_fade()
+        captions_panel.pack_forget()
+
+
+def toggle_scr_panel(show):
+    """Show/hide the SCR chat log panel."""
+    if show:
+        prompt_panel.pack_forget()
+        notes_panel.pack_forget()
+        captions_panel.pack_forget()
+        scr_panel.pack(fill="both", expand=True, padx=4, pady=(0, 4))
+    else:
+        if _scr_is_connected:
+            stop_scr()
+        scr_panel.pack_forget()
+
+
 def reset_widget_state():
     global last_external_focus, recording_focus, stop_reason, fallback_clipboard_text, fallback_active
     last_external_focus = None
@@ -2178,8 +2936,8 @@ def start_record():
         candidate = last_external_focus
 
     if not candidate or not (is_editable_uia(candidate.get("uia")) or is_editable_window_fallback(candidate.get("top"), candidate.get("uia"))):
-        # PROMPT mode doesn't need an external text field — output goes into the widget
-        if not prompt_mode_active:
+        # PROMPT mode and CAPTIONS mode don't need an external text field
+        if not prompt_mode_active and mode not in ("captions", "screen"):
             status.set("TEXT FIELD NOT READY")
             focus_status.set(" CLICK A TEXT FIELD")
             L("START REJECTED  current UIA focus is not editable current=%r candidate=%r", current_focus, candidate)
@@ -2191,6 +2949,16 @@ def start_record():
         description = "PROMPT PANEL"
         top = {}
         u = {}
+    elif mode == "captions":
+        # Captions mode: no external target, output goes to captions box
+        recording_focus = {"top": None, "uia": None, "_captions": True}
+        description = "CAPTIONS PANEL"
+        top = {}
+        u = {}
+    elif mode == "screen":
+        # SCR mode is started via its own orb — mic button does nothing here
+        L("START ignored in SCR mode — use the SCR orb")
+        return
     else:
         recording_focus = candidate
         top = candidate["top"]
@@ -2272,10 +3040,9 @@ def start_record():
     mode_live.config(state="disabled")
     mode_buf.config(state="disabled")
     mode_pro.config(state="disabled")
-    try:
-        mode_not.config(state="disabled")
-    except Exception:
-        pass
+    for _mb in (mode_not, mode_conv, mode_cap, mode_scr):
+        try: _mb.config(state="disabled")
+        except Exception: pass
     L(
         "START ACCEPTED mode=%s top=%s focus_uia=%r description=%r",
         mode_name,
@@ -2284,7 +3051,7 @@ def start_record():
         description,
     )
     current_future = asyncio.run_coroutine_threadsafe(
-        record_once(mode == "live" or prompt_mode_active), loop
+        record_once(mode == "live" or prompt_mode_active or mode == "captions"), loop
     )
     root.after(100, poll_result)
 
@@ -2310,6 +3077,9 @@ def stop_record(reason="user stop"):
     mode_live.config(state="disabled")
     mode_buf.config(state="disabled")
     mode_pro.config(state="disabled")
+    for _mb in (mode_not, mode_conv, mode_cap, mode_scr):
+        try: _mb.config(state="disabled")
+        except Exception: pass
     L("STOP received reason=%r", reason)
 
 
@@ -2433,10 +3203,9 @@ def poll_result():
         mode_live.config(state="normal")
         mode_buf.config(state="normal")
         mode_pro.config(state="normal")
-        try:
-            mode_not.config(state="normal")
-        except Exception:
-            pass
+        for _mb in (mode_not, mode_conv, mode_cap, mode_scr):
+            try: _mb.config(state="normal")
+            except Exception: pass
         focus_status.set(" Dictate")
         state_label.config(fg=MUTED)
         show_clipboard_fallback(False)
@@ -2451,9 +3220,11 @@ def set_mode(new_mode):
     UNSEL_BG = "#09090b"
     SEL_FG   = "#f4f4f5"
     UNSEL_FG = "#52525b"
-    is_prompt = (mode == "prompt")
-    is_notes  = (mode == "notes")
-    is_conv   = (mode == "conv")
+    is_prompt   = (mode == "prompt")
+    is_notes    = (mode == "notes")
+    is_conv     = (mode == "conv")
+    is_captions = (mode == "captions")
+    is_screen   = (mode == "screen")
     mode_live.config(bg=SEL_BG if mode == "live"     else UNSEL_BG,
                      fg=SEL_FG if mode == "live"     else UNSEL_FG)
     mode_buf.config( bg=SEL_BG if mode == "buffered" else UNSEL_BG,
@@ -2464,29 +3235,37 @@ def set_mode(new_mode):
                      fg=SEL_FG if is_notes           else UNSEL_FG)
     mode_conv.config(bg=SEL_BG if is_conv            else UNSEL_BG,
                      fg=SEL_FG if is_conv            else UNSEL_FG)
+    mode_cap.config( bg=SEL_BG if is_captions        else UNSEL_BG,
+                     fg=SEL_FG if is_captions        else UNSEL_FG)
+    mode_scr.config( bg=SEL_BG if is_screen          else UNSEL_BG,
+                     fg=SEL_FG if is_screen          else UNSEL_FG)
 
-    # Set geometry FIRST — before panels pack, to avoid the resize glitch
     x, y = root.winfo_x(), root.winfo_y()
     if is_prompt or is_notes or is_conv:
         root.geometry(f"500x120+{x}+{y}" if is_conv else f"500x500+{x}+{y}")
+    elif is_captions:
+        root.geometry(f"500x160+{x}+{y}")
+    elif is_screen:
+        root.geometry(f"500x420+{x}+{y}")
     else:
         root.geometry(f"500x54+{x}+{y}")
 
     toggle_conv_panel(is_conv)
     toggle_prompt_panel(is_prompt)
     toggle_notes_panel(is_notes)
+    toggle_captions_panel(is_captions)
+    toggle_scr_panel(is_screen)
 
-    # Hide main mic in NTS and CONV
     if is_notes or is_conv:
         btn.grid_remove()
     else:
         btn.grid()
 
-    # Hide lock button on PRO, NTS and CONV
     if is_prompt or is_notes or is_conv:
         lock_btn.grid_remove()
     else:
         lock_btn.grid()
+
     if is_prompt:
         mode_help.set("PROMPT")
         focus_status.set(" Dictate prompt")
@@ -2498,6 +3277,14 @@ def set_mode(new_mode):
     elif is_conv:
         mode_help.set("CONV")
         focus_status.set(" Voice Chat")
+        state_label.config(fg=MUTED)
+    elif is_captions:
+        mode_help.set("CAP")
+        focus_status.set(" Captions")
+        state_label.config(fg=MUTED)
+    elif is_screen:
+        mode_help.set("SCR")
+        focus_status.set(" Screen Assistant")
         state_label.config(fg=MUTED)
     else:
         mode_help.set("LIVE" if mode == "live" else "BUFFER")
@@ -2639,22 +3426,26 @@ def hotkey_poll():
 
 
 def idle_stop_poll():
-    """Auto-stop recording if no keyboard/mouse interaction for IDLE_STOP_SECONDS."""
+    """Auto-stop recording if no keyboard/mouse interaction for IDLE_STOP_SECONDS.
+    CAP mode uses 3-minute timeout. Loopback audio never idle-stops."""
     if recording:
+        loopback_active = (AUDIO_SOURCE in ("loopback", "both"))
+        if loopback_active:
+            root.after(500, idle_stop_poll)
+            return
         idle = get_idle_seconds()
-        if idle >= IDLE_STOP_SECONDS:
+        idle_threshold = 180.0 if mode == "captions" else IDLE_STOP_SECONDS
+        if idle >= idle_threshold:
             L("IDLE AUTO-STOP  no user interaction for %.1fs", idle)
             focus_status.set(" IDLE — stopping")
             state_label.config(fg="#f59e0b")
-            root.after(0, stop_record, "idle auto-stop (no interaction for 15s)")
-        elif idle >= (IDLE_STOP_SECONDS - 5):
-            remaining = max(1, int(IDLE_STOP_SECONDS - idle) + 1)
+            root.after(0, stop_record, f"idle auto-stop (no interaction for {idle_threshold:.0f}s)")
+        elif idle >= (idle_threshold - 5):
+            remaining = max(1, int(idle_threshold - idle) + 1)
             focus_status.set(f"⏱ idle stop in {remaining}s")
             state_label.config(fg="#f59e0b")
         else:
-            if focus_lock:
-                pass
-            else:
+            if not focus_lock:
                 focus_status.set(" RECORDING")
                 state_label.config(fg=STOP)
     root.after(500, idle_stop_poll)
@@ -2938,7 +3729,79 @@ mode_conv = tk.Button(mode_wrap, text="CONV", command=lambda: set_mode("conv"),
     activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
     cursor="hand2")
 mode_conv.grid(row=0, column=4, sticky="nsew", padx=2, pady=2)
+mode_cap = tk.Button(mode_wrap, text="CAP", command=lambda: set_mode("captions"),
+    font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
+    activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
+    cursor="hand2")
+mode_cap.grid(row=0, column=5, sticky="nsew", padx=2, pady=2)
+mode_wrap.grid_columnconfigure(5, weight=1, uniform="mode")
+mode_scr = tk.Button(mode_wrap, text="SCR", command=lambda: set_mode("screen"),
+    font=(_UI_FONT or "Segoe UI", 8, "bold"), fg=MUTED, bg="#09090b",
+    activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
+    cursor="hand2")
+mode_scr.grid(row=0, column=6, sticky="nsew", padx=2, pady=2)
+mode_wrap.grid_columnconfigure(6, weight=1, uniform="mode")
 mode_label = mode_live
+
+# ── Audio source toggle (row 1 of pill) ─────────────────────────────────────
+pill.grid_rowconfigure(1, weight=0)
+_audio_src_labels = {"mic": "🎤 MIC", "loopback": "🔊 SYS", "both": "🎤+🔊"}
+_audio_src_order  = ["mic", "loopback", "both"]
+_audio_src_tooltips = {
+    "mic":      "Microphone only",
+    "loopback": "System audio only (what you hear in headphones/speakers)",
+    "both":     "Mic + system audio mixed",
+}
+
+def _cycle_audio_source():
+    global AUDIO_SOURCE
+    idx = _audio_src_order.index(AUDIO_SOURCE)
+    AUDIO_SOURCE = _audio_src_order[(idx + 1) % len(_audio_src_order)]
+    audio_src_btn.config(text=_audio_src_labels[AUDIO_SOURCE])
+    L("AUDIO SOURCE changed to %s", AUDIO_SOURCE)
+
+audio_src_btn = tk.Button(
+    pill, text=_audio_src_labels[AUDIO_SOURCE],
+    command=_cycle_audio_source,
+    font=(_UI_FONT or "Segoe UI", 7, "bold"), fg=MUTED, bg=BG,
+    activebackground="#27272a", activeforeground=TEXT, relief="flat", bd=0,
+    cursor="hand2", padx=4, pady=0,
+)
+audio_src_btn.grid(row=1, column=0, columnspan=2, sticky="w", padx=(2, 0), pady=(0, 3))
+
+# ── Language dropdown (row 1, right side of pill) ────────────────────────────
+_LANG_OPTIONS = [
+    ("Auto",    "auto"),
+    ("English", "en-US"),
+    ("Arabic",  "ar-SA"),
+    ("Spanish", "es-ES"),
+    ("Italian", "it-IT"),
+]
+_lang_var = tk.StringVar(value="English")  # display label
+
+def _set_lang(display, code):
+    global TRANSCRIBE_LANG
+    TRANSCRIBE_LANG = code
+    _lang_var.set(display)
+    L("TRANSCRIBE LANG changed to %s (%s)", display, code)
+
+# Build OptionMenu from label list
+_lang_menu = tk.OptionMenu(
+    pill, _lang_var,
+    *[d for d, _ in _LANG_OPTIONS],
+    command=lambda chosen: _set_lang(chosen, dict(_LANG_OPTIONS)[chosen])
+)
+_lang_menu.config(
+    font=(_UI_FONT or "Segoe UI", 7, "bold"), fg=MUTED, bg=BG,
+    activebackground="#27272a", activeforeground=TEXT,
+    relief="flat", bd=0, highlightthickness=0,
+    indicatoron=True, padx=3, pady=0,
+)
+_lang_menu["menu"].config(
+    bg="#1a1a1f", fg=TEXT, activebackground="#3f3f46", activeforeground=TEXT,
+    font=(_UI_FONT or "Segoe UI", 8), bd=0, relief="flat",
+)
+_lang_menu.grid(row=1, column=2, columnspan=3, sticky="e", padx=(0, 4), pady=(0, 3))
 
 btn = tk.Canvas(
     pill, width=32, height=32,
@@ -3507,7 +4370,383 @@ _N = {
 notes_panel = tk.Frame(frame, bg=_N["panel_bg"], padx=0, pady=0)
 # Not packed by default
 
-# Amber accent line — matches PRO's green line height
+# ---------------------------------------------------------------------------
+# CAPTIONS panel — live scrolling transcript, no text field needed
+# ---------------------------------------------------------------------------
+_CAP_BG   = "#0a0a0e"
+_CAP_FG   = "#f4f4f5"
+_CAP_FONT = (_UI_FONT or "Segoe UI", 11, "bold")
+
+captions_panel = tk.Frame(frame, bg=_CAP_BG, padx=0, pady=0)
+# Not packed by default — toggle_captions_panel() shows/hides it
+
+tk.Frame(captions_panel, bg="#7c3aed", height=2).pack(fill="x")
+
+_cap_inner = tk.Frame(captions_panel, bg=_CAP_BG, padx=10, pady=8)
+_cap_inner.pack(fill="both", expand=True)
+
+_cap_text = tk.Text(
+    _cap_inner, height=4, bg=_CAP_BG, fg=_CAP_FG, font=_CAP_FONT,
+    wrap="word", relief="flat", bd=0, state="disabled", cursor="arrow",
+    highlightthickness=0, insertwidth=0, spacing1=2, spacing3=2,
+)
+_cap_text.pack(fill="both", expand=True)
+_cap_text.tag_configure("interim", foreground="#71717a")
+_cap_text.tag_configure("final",   foreground=_CAP_FG)
+
+# Load Noto Sans Arabic for clean RTL rendering
+_ARABIC_FONT = (_UI_FONT or "Segoe UI", 11, "bold")
+try:
+    import tkinter.font as _tkfont
+    _noto_arabic_path = r"C:\Users\Administrator\Downloads\Noto_Sans_Arabic\NotoSansArabic-VariableFont_wdth,wght.ttf"
+    if os.path.exists(_noto_arabic_path):
+        root.tk.call("font", "create", "NotoSansArabic", "-family", "Noto Sans Arabic", "-size", 12)
+        root.tk.call("load", "", "Img")  # dummy — just ensure tk is ready
+        import ctypes as _ctypes
+        _ctypes.windll.gdi32.AddFontResourceExW(_noto_arabic_path, 0x10, None)
+        _ARABIC_FONT = ("Noto Sans Arabic", 12, "bold")
+except Exception:
+    pass
+
+_cap_text.tag_configure("interim_rtl", foreground="#71717a", justify="right", font=_ARABIC_FONT)
+_cap_text.tag_configure("final_rtl",   foreground=_CAP_FG,  justify="right", font=_ARABIC_FONT)
+
+def _is_rtl(text):
+    """Returns True if text contains Arabic, Hebrew, or other RTL characters."""
+    for ch in text:
+        cp = ord(ch)
+        if 0x0600 <= cp <= 0x06FF:  # Arabic
+            return True
+        if 0x0590 <= cp <= 0x05FF:  # Hebrew
+            return True
+        if 0xFB50 <= cp <= 0xFDFF:  # Arabic Presentation Forms
+            return True
+    return False
+
+_cap_current_interim = [""]
+
+def _captions_append(text, final):
+    """Stream captions like a chat — finals accumulate, interim dims at the tail.
+    Arabic/RTL text is held until final to avoid reversed word-order streaming."""
+    _cap_text.config(state="normal")
+    rtl = _is_rtl(text)
+    itag = "interim_rtl" if rtl else "interim"
+    ftag = "final_rtl"   if rtl else "final"
+    if not final:
+        if rtl:
+            # Don't stream Arabic word-by-word — accumulate silently until final
+            _cap_text.config(state="disabled")
+            return
+        # Remove previous interim preview, replace with updated one
+        try:
+            _cap_text.delete("interim_start", "end")
+        except Exception:
+            pass
+        _cap_text.mark_set("interim_start", "end-1c")
+        _cap_text.mark_gravity("interim_start", "left")
+        _cap_current_interim[0] = text
+        _cap_text.insert("end", text, itag)
+    else:
+        # Remove dim interim, commit final as permanent bright text + space
+        try:
+            _cap_text.delete("interim_start", "end")
+        except Exception:
+            pass
+        _cap_current_interim[0] = ""
+        _cap_text.insert("end", text + " ", ftag)
+        # Rolling trim — keep last ~3000 chars so the box never fills forever
+        while True:
+            content = _cap_text.get("1.0", "end-1c")
+            if len(content) <= 3000:
+                break
+            _cap_text.delete("1.0", "2.0")
+    _cap_text.see("end")
+    _cap_text.config(state="disabled")
+
+def _cap_clear():
+    _cap_text.config(state="normal")
+    _cap_text.delete("1.0", "end")
+    _cap_text.config(state="disabled")
+
+_cap_btn_row = tk.Frame(_cap_inner, bg=_CAP_BG)
+_cap_btn_row.pack(fill="x", pady=(4, 0))
+tk.Button(
+    _cap_btn_row, text="CLEAR", command=_cap_clear,
+    font=(_UI_FONT or "Segoe UI", 7, "bold"), fg="#52525b", bg=_CAP_BG,
+    activebackground="#27272a", activeforeground=_CAP_FG,
+    relief="flat", bd=0, cursor="hand2", padx=4,
+).pack(side="left")
+
+# ---------------------------------------------------------------------------
+# CAP mode pill-fade: hide pill after 4s inactivity, restore on caption hover
+# ---------------------------------------------------------------------------
+_cap_fade_after_id = [None]
+_cap_pill_visible  = [True]
+
+def _cap_pill_fade():
+    """Hide the pill (top bar) when in CAP mode — captions panel stays visible."""
+    if mode != "captions":
+        return
+    if not _cap_pill_visible[0]:
+        return
+    _cap_pill_visible[0] = False
+    pill.pack_forget()
+
+def _cap_pill_restore():
+    """Restore the pill when hovering the captions area in CAP mode."""
+    if not _cap_pill_visible[0]:
+        _cap_pill_visible[0] = True
+        pill.pack(fill="x", before=captions_panel)
+    # Reset fade timer
+    if _cap_fade_after_id[0]:
+        root.after_cancel(_cap_fade_after_id[0])
+    _cap_fade_after_id[0] = root.after(4000, _cap_pill_fade)
+
+def _cap_schedule_fade():
+    """Start/restart the 4-second fade timer when entering CAP mode."""
+    if _cap_fade_after_id[0]:
+        root.after_cancel(_cap_fade_after_id[0])
+    _cap_pill_visible[0] = True
+    if not pill.winfo_ismapped():
+        pill.pack(fill="x", before=captions_panel)
+    _cap_fade_after_id[0] = root.after(4000, _cap_pill_fade)
+
+def _cap_cancel_fade():
+    """Cancel fade timer when leaving CAP mode — restore pill."""
+    if _cap_fade_after_id[0]:
+        root.after_cancel(_cap_fade_after_id[0])
+        _cap_fade_after_id[0] = None
+    if not _cap_pill_visible[0]:
+        _cap_pill_visible[0] = True
+        pill.pack(fill="x")
+
+# Bind hover on captions panel and text widget
+captions_panel.bind("<Enter>", lambda e: _cap_pill_restore() if mode == "captions" else None)
+_cap_text.bind("<Enter>",      lambda e: _cap_pill_restore() if mode == "captions" else None)
+_cap_inner.bind("<Enter>",     lambda e: _cap_pill_restore() if mode == "captions" else None)
+
+# ---------------------------------------------------------------------------
+# SCR panel — persistent scrollable chat log
+# ---------------------------------------------------------------------------
+_SCR_BG      = "#0a0a0e"
+_SCR_FG      = "#f4f4f5"
+_SCR_MUTED   = "#71717a"
+_SCR_YOU_FG  = "#a3e635"   # lime — your speech
+_SCR_AI_FG   = "#60a5fa"   # blue — Gemini
+_SCR_FONT    = (_UI_FONT or "Segoe UI", 9)
+_SCR_BOLD    = (_UI_FONT or "Segoe UI", 9, "bold")
+
+scr_panel = tk.Frame(frame, bg=_SCR_BG, padx=0, pady=0)
+# Not packed by default
+
+tk.Frame(scr_panel, bg="#7c3aed", height=2).pack(fill="x")
+
+_scr_inner = tk.Frame(scr_panel, bg=_SCR_BG, padx=8, pady=6)
+_scr_inner.pack(fill="both", expand=True)
+
+# Chat log — scrollable Text widget
+_scr_log_frame = tk.Frame(_scr_inner, bg=_SCR_BG)
+_scr_log_frame.pack(fill="both", expand=True)
+
+_scr_scrollbar = tk.Scrollbar(_scr_log_frame, bg=_SCR_BG, troughcolor=_SCR_BG,
+                               activebackground="#3f3f46", width=6, bd=0)
+_scr_scrollbar.pack(side="right", fill="y")
+
+_scr_log = tk.Text(
+    _scr_log_frame, height=18, bg=_SCR_BG, fg=_SCR_FG,
+    font=_SCR_FONT, wrap="word", relief="flat", bd=0,
+    state="disabled", cursor="arrow", highlightthickness=0,
+    yscrollcommand=_scr_scrollbar.set, spacing1=1, spacing3=3,
+)
+_scr_log.pack(side="left", fill="both", expand=True)
+_scr_scrollbar.config(command=_scr_log.yview)
+
+# Text tags
+_scr_log.tag_configure("you_label",    foreground=_SCR_YOU_FG, font=_SCR_BOLD)
+_scr_log.tag_configure("you_text",     foreground=_SCR_FG,     font=_SCR_FONT)
+_scr_log.tag_configure("ai_label",     foreground=_SCR_AI_FG,  font=_SCR_BOLD)
+_scr_log.tag_configure("ai_text",      foreground=_SCR_FG,     font=_SCR_FONT)
+_scr_log.tag_configure("ai_streaming", foreground=_SCR_MUTED,  font=_SCR_FONT)
+_scr_log.tag_configure("ts",           foreground="#3f3f46",    font=(_UI_FONT or "Segoe UI", 7))
+_scr_log.tag_configure("status",       foreground=_SCR_MUTED,  font=(_UI_FONT or "Segoe UI", 8, "italic"))
+
+# Bottom row: status label + clear button
+_scr_bottom = tk.Frame(_scr_inner, bg=_SCR_BG)
+_scr_bottom.pack(fill="x", pady=(4, 0))
+_scr_status_var = tk.StringVar(value="● Idle")
+tk.Label(_scr_bottom, textvariable=_scr_status_var,
+         font=(_UI_FONT or "Segoe UI", 7, "bold"), fg=_SCR_MUTED,
+         bg=_SCR_BG, anchor="w").pack(side="left")
+_scr_token_var = tk.StringVar(value="")
+tk.Label(_scr_bottom, textvariable=_scr_token_var,
+         font=(_UI_FONT or "Segoe UI", 7), fg="#3f3f46",
+         bg=_SCR_BG, anchor="w").pack(side="left", padx=(8, 0))
+
+def _scr_clear_log_ui():
+    _scr_log.config(state="normal")
+    _scr_log.delete("1.0", "end")
+    _scr_log.config(state="disabled")
+
+tk.Button(
+    _scr_bottom, text="CLEAR", command=_scr_clear_log_ui,
+    font=(_UI_FONT or "Segoe UI", 7, "bold"), fg=_SCR_MUTED, bg=_SCR_BG,
+    activebackground="#27272a", activeforeground=_SCR_FG,
+    relief="flat", bd=0, cursor="hand2", padx=4,
+).pack(side="right")
+
+# Orb / start-stop button inside the panel header
+_scr_orb_row = tk.Frame(scr_panel, bg=_SCR_BG)
+_scr_orb_row.pack(fill="x", padx=8, pady=(4, 0), before=_scr_inner)
+
+_scr_orb_btn = tk.Canvas(_scr_orb_row, width=28, height=28,
+                          bg=_SCR_BG, highlightthickness=0, bd=0, cursor="hand2")
+_scr_orb_btn.pack(side="left")
+
+_scr_orb_label = tk.Label(_scr_orb_row, text="Tap to start screen session",
+                           font=(_UI_FONT or "Segoe UI", 8), fg=_SCR_MUTED,
+                           bg=_SCR_BG, anchor="w")
+_scr_orb_label.pack(side="left", padx=(6, 0))
+
+# ── SCR helper functions (Tk thread) ────────────────────────────────────────
+_scr_last_speaker   = [None]
+_scr_stream_mark    = [""]
+_scr_turn_end_time  = [0.0]   # epoch of last __turn_end__, for continuation debounce
+
+def _scr_draw_orb(state="idle"):
+    _scr_orb_btn.delete("all")
+    colors = {"idle": "#3f3f46", "connecting": "#f59e0b",
+              "listening": "#22c55e", "speaking": "#60a5fa", "error": "#f87171"}
+    c = colors.get(state, "#3f3f46")
+    _scr_orb_btn.create_oval(4, 4, 24, 24, fill=c, outline="")
+
+_scr_draw_orb("idle")
+
+def _scr_orb_tap(e=None):
+    if _scr_is_connected:
+        stop_scr()
+    else:
+        start_scr()
+
+_scr_orb_btn.bind("<Button-1>", _scr_orb_tap)
+
+
+def _scr_set_ui_status(status):
+    _scr_draw_orb(status)
+    labels = {
+        "idle":       "● Idle  — tap orb to start",
+        "connecting": "● Connecting…",
+        "listening":  "● Listening — speak or ask",
+        "speaking":   "● Gemini speaking",
+        "stopped":    "● Stopped",
+        "error":      "● Error — check log",
+    }
+    _scr_status_var.set(labels.get(status, f"● {status}"))
+    _scr_token_var.set(
+        f"~{_scr_session_tokens[0]:,} tokens  {_scr_frames_sent[0]} frames"
+        if _scr_session_tokens[0] else ""
+    )
+
+
+def _scr_push_message(speaker, text):
+    """Append or update a streaming bubble in the chat log (Tk thread).
+
+    speaker: "ai_chunk" | "user_chunk" | "__turn_end__"
+    text:    raw chunk to append (for chunks) or "" (for turn_end)
+    """
+    import time as _t
+    log = _scr_log
+
+    if speaker == "__turn_end__":
+        # Commit streaming tag but keep last_speaker set.
+        # Record timestamp — next chunk within 1.5s is treated as continuation.
+        if _scr_stream_mark[0]:
+            log.config(state="normal")
+            try:
+                mark = _scr_stream_mark[0]
+                log.tag_remove("ai_streaming", mark, "end")
+                log.tag_add("ai_text", mark, "end")
+            except Exception:
+                pass
+            log.config(state="disabled")
+            _scr_stream_mark[0] = ""
+        _scr_turn_end_time[0] = _t.time()
+        return
+
+    is_ai       = speaker == "ai_chunk"
+    speaker_key = "ai" if is_ai else "user"
+    tag         = "ai_streaming" if is_ai else "you_text"
+
+    log.config(state="normal")
+
+    elapsed = _t.time() - _scr_turn_end_time[0]
+    is_continuation = (
+        _scr_last_speaker[0] == speaker_key
+        and _scr_turn_end_time[0] > 0.0
+        and elapsed < 1.5
+    )
+    still_streaming = (
+        _scr_last_speaker[0] == speaker_key
+        and _scr_turn_end_time[0] == 0.0
+    )
+
+    if is_continuation or still_streaming:
+        L("SCR UI APPEND speaker=%s chunk=%r cont=%s", speaker_key, text[:40], is_continuation)
+        log.insert("end", text, tag)
+        if is_continuation:
+            # Re-open streaming mark for this continuation block
+            if not _scr_stream_mark[0] and is_ai:
+                mark_name = f"scr_s_{int(_t.time()*1000)}"
+                log.mark_set(mark_name, "end-1c")
+                log.mark_gravity(mark_name, "left")
+                _scr_stream_mark[0] = mark_name
+            _scr_turn_end_time[0] = 0.0  # back in active streaming
+    else:
+        # New bubble — finalize previous if any
+        if _scr_stream_mark[0]:
+            try:
+                mark = _scr_stream_mark[0]
+                log.tag_remove("ai_streaming", mark, "end")
+                log.tag_add("ai_text", mark, "end")
+            except Exception:
+                pass
+            _scr_stream_mark[0] = ""
+        _scr_turn_end_time[0] = 0.0
+
+        ts = _t.strftime("%H:%M")
+        log.insert("end", f"\n{ts}  ", "ts")
+        log.insert("end", "Gemini  " if is_ai else "You  ",
+                   "ai_label" if is_ai else "you_label")
+
+        if is_ai:
+            mark_name = f"scr_s_{int(_t.time()*1000)}"
+            log.mark_set(mark_name, "end")
+            log.mark_gravity(mark_name, "left")
+            _scr_stream_mark[0] = mark_name
+
+        L("SCR UI NEW BUBBLE speaker=%s text=%r last_was=%r elapsed=%.2f",
+          speaker_key, text[:40], _scr_last_speaker[0], elapsed)
+        log.insert("end", text, tag)
+        _scr_last_speaker[0] = speaker_key
+
+    log.see("end")
+    log.config(state="disabled")
+    _scr_token_var.set(
+        f"~{_scr_session_tokens[0]:,} tokens  {_scr_frames_sent[0]} frames"
+        if _scr_session_tokens[0] else ""
+    )
+
+
+def _scr_clear_chat():
+    """Called at session start to reset log state."""
+    _scr_last_speaker[0]  = None
+    _scr_stream_mark[0]   = ""
+    _scr_turn_end_time[0] = 0.0
+    _scr_clear_log_ui()
+    _scr_token_var.set("")
+    _scr_status_var.set("● Idle")
+
+
+# ---------------------------------------------------------------------------
 tk.Frame(notes_panel, bg=_N["accent"], height=2).pack(fill="x")
 
 _ni = tk.Frame(notes_panel, bg=_N["panel_bg"], padx=10, pady=8)
@@ -3965,7 +5204,9 @@ def _notes_open_editor(note=None):
                 client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY", ""))
                 cfg = types.LiveConnectConfig(
                     response_modalities=["TEXT"],
-                    input_audio_transcription=types.AudioTranscriptionConfig(language_codes=[]),
+                    input_audio_transcription=types.AudioTranscriptionConfig(
+                        language_codes=[] if TRANSCRIBE_LANG == "auto" else [TRANSCRIBE_LANG]
+                    ),
                 )
                 async with client.aio.live.connect(model=MODEL, config=cfg) as session:
                     audio_q: asyncio.Queue = asyncio.Queue()
@@ -4610,7 +5851,7 @@ _CV = {
 # ---------------------------------------------------------------------------
 _conv_cap_rows  = []
 _MAX_CAPTIONS   = 6
-_ORB_ROW_H      = 64   # height of the orb row section
+_ORB_ROW_H      = 80   # height of the orb row section
 _CAP_W          = 490  # caption strip width (matches main widget)
 _CAP_MARGIN     = 5
 
@@ -4622,12 +5863,13 @@ def _conv_blend(fg, bg, a):
 
 # --- Orb row frame (packed into `frame`, same parent as prompt_panel/notes_panel)
 conv_panel = tk.Frame(frame, bg=_CV["orb_row_bg"], height=_ORB_ROW_H)
+conv_panel.pack_propagate(False)
 tk.Frame(conv_panel, bg=_CV["accent"], height=2).pack(fill="x", side="top")
 
-_conv_orb_canvas = tk.Canvas(conv_panel, height=_ORB_ROW_H - 2,
+_conv_orb_canvas = tk.Canvas(conv_panel, height=_ORB_ROW_H - 4,
                               bg=_CV["orb_row_bg"], highlightthickness=0, bd=0,
                               cursor="hand2")
-_conv_orb_canvas.pack(fill="x", expand=True)
+_conv_orb_canvas.pack(fill="both", expand=True)
 
 _CONV_STATUS_LABELS = {
     "connecting": (_CV["orb_user"],  "CONNECTING..."),
@@ -4643,9 +5885,9 @@ def _conv_draw_orbs(state="stopped"):
     c = _conv_orb_canvas
     c.delete("all")
     W  = c.winfo_width() or 492
-    H  = _ORB_ROW_H - 2
+    H  = c.winfo_height() or (_ORB_ROW_H - 4)
     cy = H // 2
-    R  = 22
+    R  = min(22, cy - 6)  # ensure orb fits within canvas height
     t  = _time.time()
     ui = _conv_user_level[0]
     ai = _conv_ai_level[0]
@@ -4830,11 +6072,24 @@ def _conv_set_ui_status(status):
     _conv_draw_orbs(status)
 
 
+_conv_last_speaker = [None]   # tracks turn boundaries
+_conv_ai_buf_ref   = [None]   # reference to engine for reset on turn_end
+
 def _conv_push_caption(speaker, text):
-    if _conv_cap_rows and _conv_cap_rows[-1][0] == speaker:
-        _conv_cap_rows[-1][1] = text
+    if speaker == "__turn_end__":
+        _conv_last_speaker[0] = None
+        eng = _conv_ai_buf_ref[0]
+        if eng is not None:
+            eng._ai_buf = ""
+        return
+    if (_conv_cap_rows
+            and _conv_cap_rows[-1][0] == speaker
+            and _conv_last_speaker[0] == speaker):
+        # Append new chunk to existing bubble
+        _conv_cap_rows[-1][1] += text
     else:
         _conv_cap_rows.append([speaker, text])
+    _conv_last_speaker[0] = speaker
     if len(_conv_cap_rows) > _MAX_CAPTIONS:
         del _conv_cap_rows[:-_MAX_CAPTIONS]
     _conv_relayout_captions()
@@ -4854,11 +6109,11 @@ def _conv_clear_transcript():
 def _conv_orb_tap(e):
     if _conv_is_connected:
         stop_conv()
-        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv):
+        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv, mode_cap, mode_scr):
             try: _mb.config(state="normal")
             except Exception: pass
     else:
-        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv):
+        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv, mode_cap, mode_scr):
             try: _mb.config(state="disabled")
             except Exception: pass
         start_conv()
@@ -4880,7 +6135,7 @@ _orig_on_conv_ended = _on_conv_ended
 def _on_conv_ended():
     _orig_on_conv_ended()
     try:
-        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv):
+        for _mb in (mode_live, mode_buf, mode_pro, mode_not, mode_conv, mode_cap, mode_scr):
             try: _mb.config(state="normal")
             except Exception: pass
         _conv_draw_orbs("stopped")
