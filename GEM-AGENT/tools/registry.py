@@ -11,6 +11,7 @@ import inspect
 from typing import Callable
 
 from logger import get_logger
+from desktop.accessibility import AccessibilityAutomation
 
 log = get_logger(__name__)
 
@@ -49,6 +50,7 @@ def build_desktop_registry(runner) -> ToolRegistry:
     runner: TaskRunner (passed at construction after task runner is created)
     """
     reg = ToolRegistry()
+    _acc = AccessibilityAutomation()
 
     async def _move(x: int, y: int) -> dict:
         r = await runner.move(x, y)
@@ -131,6 +133,44 @@ def build_desktop_registry(runner) -> ToolRegistry:
     async def _get_cursor_position() -> dict:
         x, y = runner.get_cursor_position()
         return {"x": x, "y": y}
+
+    # ------------------------------------------------------------------ #
+    # Accessibility (UIA) tools — deterministic, no pixel guessing
+    # ------------------------------------------------------------------ #
+
+    async def _list_windows() -> dict:
+        return await asyncio.get_event_loop().run_in_executor(None, acc.list_windows)
+
+    async def _get_ui_tree(window_title: str, depth: int = 3) -> dict:
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: acc.get_ui_tree(window_title, depth)
+        )
+
+    async def _find_element(window_title: str, name: str = "",
+                             control_type: str = "", automation_id: str = "") -> dict:
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: acc.find_element(window_title, name, control_type, automation_id)
+        )
+
+    async def _click_element(window_title: str, name: str = "",
+                              control_type: str = "", automation_id: str = "") -> dict:
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: acc.click_element(window_title, name, control_type, automation_id)
+        )
+
+    async def _type_in_element(window_title: str, text: str, name: str = "",
+                                control_type: str = "", automation_id: str = "",
+                                clear_first: bool = True) -> dict:
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: acc.type_in_element(window_title, text, name, control_type,
+                                               automation_id, clear_first)
+        )
+
+    async def _focus_element(window_title: str, name: str = "",
+                              control_type: str = "", automation_id: str = "") -> dict:
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: acc.focus_element(window_title, name, control_type, automation_id)
+        )
 
     tools = [
         ("move_cursor", _move, {
@@ -281,6 +321,138 @@ def build_desktop_registry(runner) -> ToolRegistry:
     ]
 
     for name, fn, schema in tools:
+        reg.register(name, fn, schema)
+
+    # ------------------------------------------------------------------ #
+    # Accessibility (UIA) tools — deterministic, no pixel guessing
+    # ------------------------------------------------------------------ #
+    _acc = AccessibilityAutomation()
+
+    def _get_ui_tree(window_title: str, depth: int = 4) -> dict:
+        return _acc.get_ui_tree(window_title, depth)
+
+    def _list_interactive_elements(window_title: str) -> dict:
+        return _acc.list_interactive_elements(window_title)
+
+    def _find_element(window_title: str, name: str = "",
+                      control_type: str = "", automation_id: str = "") -> dict:
+        return _acc.find_element(window_title, name, control_type, automation_id)
+
+    def _click_element(window_title: str, name: str = "",
+                       control_type: str = "", automation_id: str = "") -> dict:
+        return _acc.click_element(window_title, name, control_type, automation_id)
+
+    def _type_in_element(window_title: str, text: str, name: str = "",
+                         control_type: str = "", automation_id: str = "") -> dict:
+        return _acc.type_in_element(window_title, text, name, control_type, automation_id)
+
+    def _focus_element(window_title: str, name: str = "",
+                       control_type: str = "", automation_id: str = "") -> dict:
+        return _acc.focus_element(window_title, name, control_type, automation_id)
+
+    def _get_element_value(window_title: str, name: str = "",
+                           control_type: str = "", automation_id: str = "") -> dict:
+        return _acc.get_element_value(window_title, name, control_type, automation_id)
+
+    acc_tools = [
+        ("get_ui_tree", _get_ui_tree, {
+            "name": "get_ui_tree",
+            "description": (
+                "Read the Accessibility Tree of a window up to N levels deep. "
+                "Use this FIRST when you need to find what UI elements exist in an app "
+                "before interacting with them. Returns element names, types, and coordinates. "
+                "Prefer this over guessing coordinates from a screenshot."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "window_title": {"type": "string", "description": "Partial window title, e.g. 'Chrome', 'Notepad', 'Discord'"},
+                "depth": {"type": "integer", "description": "Tree depth (1-6). Default 4.", "default": 4},
+            }, "required": ["window_title"]},
+        }),
+        ("list_interactive_elements", _list_interactive_elements, {
+            "name": "list_interactive_elements",
+            "description": (
+                "List all interactive elements (buttons, text inputs, checkboxes, links) "
+                "in a window with their exact screen coordinates. "
+                "Use this instead of scanning a screenshot to find what to click."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "window_title": {"type": "string", "description": "Partial window title"},
+            }, "required": ["window_title"]},
+        }),
+        ("find_element", _find_element, {
+            "name": "find_element",
+            "description": (
+                "Find a specific UI element by name, type, or automationId and get its exact coordinates. "
+                "Returns center_x/center_y you can pass directly to click() if needed. "
+                "Example: find_element('Discord', name='Message Input') to get the exact position of the chat box."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "window_title": {"type": "string"},
+                "name": {"type": "string", "description": "Element label/title, e.g. 'Send', 'Message Input', 'Search'"},
+                "control_type": {"type": "string", "description": "UIA control type e.g. 'Button', 'Edit', 'Document'"},
+                "automation_id": {"type": "string", "description": "AutomationId if known"},
+            }, "required": ["window_title"]},
+        }),
+        ("click_element", _click_element, {
+            "name": "click_element",
+            "description": (
+                "Click a UI element by name or type — NO pixel coordinate guessing. "
+                "ALWAYS prefer this over click(x,y) when you know the element's name. "
+                "Examples: click_element('Chrome', name='Close') closes a tab, "
+                "click_element('Discord', name='Send Message') clicks the send button."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "window_title": {"type": "string"},
+                "name": {"type": "string", "description": "Element name/label"},
+                "control_type": {"type": "string", "description": "UIA control type e.g. 'Button'"},
+                "automation_id": {"type": "string"},
+            }, "required": ["window_title"]},
+        }),
+        ("type_in_element", _type_in_element, {
+            "name": "type_in_element",
+            "description": (
+                "Focus a text input element and type text into it — completely replaces clicking + typing. "
+                "ALWAYS use this instead of click(x,y) + type_text() for text fields. "
+                "Finds the field by name/type, focuses it, clears it, then types. "
+                "Example: type_in_element('Discord', 'Hello!', name='Message Input')"
+            ),
+            "parameters": {"type": "object", "properties": {
+                "window_title": {"type": "string"},
+                "text": {"type": "string", "description": "Text to type into the element"},
+                "name": {"type": "string", "description": "Element label, e.g. 'Message Input', 'Search', 'Address bar'"},
+                "control_type": {"type": "string", "description": "UIA control type e.g. 'Edit', 'Document'"},
+                "automation_id": {"type": "string"},
+            }, "required": ["window_title", "text"]},
+        }),
+        ("focus_element", _focus_element, {
+            "name": "focus_element",
+            "description": (
+                "Set keyboard focus to a UI element without clicking. "
+                "Use before press_key() or hotkey() when you need focus on a specific field."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "window_title": {"type": "string"},
+                "name": {"type": "string"},
+                "control_type": {"type": "string"},
+                "automation_id": {"type": "string"},
+            }, "required": ["window_title"]},
+        }),
+        ("get_element_value", _get_element_value, {
+            "name": "get_element_value",
+            "description": (
+                "Read the current text/value of a UI element. "
+                "Use this to verify a field was filled correctly after type_in_element."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "window_title": {"type": "string"},
+                "name": {"type": "string"},
+                "control_type": {"type": "string"},
+                "automation_id": {"type": "string"},
+            }, "required": ["window_title"]},
+        }),
+    ]
+
+    for name, fn, schema in acc_tools:
         reg.register(name, fn, schema)
 
     return reg
