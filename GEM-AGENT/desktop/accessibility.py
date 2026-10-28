@@ -1,18 +1,14 @@
 """
 desktop/accessibility.py — Windows UI Automation (UIA) based element interaction.
 
-Uses comtypes + pywinauto to query the Accessibility Tree instead of guessing
-pixel coordinates from screenshots. This makes clicks on named elements
-(buttons, text fields, etc.) completely deterministic and error-free.
+Uses pywinauto (UIA backend) to find elements by name/role/automationId
+and interact with them deterministically — no pixel coordinate guessing.
 
-Strategy (hybrid):
-  1. Try UIA first — find element by name/role/automationId, get its exact rect.
-  2. Fall back to pixel coords only if UIA can't find the element.
-
-Works with: native Win32, WPF, WinForms, Electron (Chrome-based), UWP, browsers.
-Does NOT work with: pure OpenGL/DirectX games, some older Java apps.
+Multi-match strategy: always pin to a single window handle first, then walk
+descendants() directly. This avoids the "N elements match" exception entirely.
 """
 
+import re
 import time
 from dataclasses import dataclass
 
@@ -20,17 +16,16 @@ from logger import get_logger
 
 log = get_logger(__name__)
 
-# ---------------------------------------------------------------------------
-# Lazy import — don't crash on startup if pywinauto isn't installed yet
-# ---------------------------------------------------------------------------
 try:
-    from pywinauto import Desktop, Application
+    from pywinauto import Desktop
     from pywinauto.findwindows import ElementNotFoundError
-    _PYWINAUTO_OK = True
+    _OK = True
 except ImportError:
-    _PYWINAUTO_OK = False
-    log.warning("pywinauto not installed — accessibility tools unavailable. Run: pip install pywinauto")
+    _OK = False
+    log.warning("pywinauto not installed — run: pip install pywinauto")
 
+
+# ── data ─────────────────────────────────────────────────────────────────────
 
 @dataclass
 class UIElement:
@@ -39,347 +34,266 @@ class UIElement:
     automation_id: str
     center_x: int
     center_y: int
-    rect: tuple[int, int, int, int]   # left, top, right, bottom
+    rect: tuple[int, int, int, int]
     is_enabled: bool
     is_visible: bool
 
 
-def _require_pywinauto() -> str | None:
-    if not _PYWINAUTO_OK:
-        return "pywinauto not installed. Run: pip install pywinauto"
-    return None
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _require() -> str | None:
+    return None if _OK else "pywinauto not installed. Run: pip install pywinauto"
 
 
-def _get_app_window(window_title: str):
-    """Return the first matching pywinauto WindowSpecification."""
+def _get_win(window_title: str):
+    """Return a window spec pinned to the first visible matching handle."""
     desktop = Desktop(backend="uia")
-    return desktop.window(title_re=f".*{window_title}.*")
+    pat = f".*{re.escape(window_title)}.*"
+    wins = desktop.windows(title_re=pat, visible_only=True)
+    if not wins:
+        wins = desktop.windows(title_re=pat)
+    if not wins:
+        raise ElementNotFoundError(f"No window matching '{window_title}'")
+    return desktop.window(handle=wins[0].handle)
 
 
-def _element_to_ui(el) -> UIElement:
-    rect = el.rectangle()
-    cx = (rect.left + rect.right) // 2
-    cy = (rect.top + rect.bottom) // 2
-    try:
-        auto_id = el.automation_id() or ""
-    except Exception:
-        auto_id = ""
-    try:
-        enabled = el.is_enabled()
-    except Exception:
-        enabled = True
-    try:
-        visible = el.is_visible()
-    except Exception:
-        visible = True
+def _wrap_to_ui(wrapper) -> UIElement:
+    r = wrapper.rectangle()
+    cx = (r.left + r.right) // 2
+    cy = (r.top + r.bottom) // 2
+    try:    aid = wrapper.automation_id() or ""
+    except: aid = ""
+    try:    ena = wrapper.is_enabled()
+    except: ena = True
+    try:    vis = wrapper.is_visible()
+    except: vis = True
     return UIElement(
-        name=el.window_text() or "",
-        control_type=el.friendly_class_name() or "",
-        automation_id=auto_id,
+        name=wrapper.window_text() or "",
+        control_type=wrapper.friendly_class_name() or "",
+        automation_id=aid,
         center_x=cx,
         center_y=cy,
-        rect=(rect.left, rect.top, rect.right, rect.bottom),
-        is_enabled=enabled,
-        is_visible=visible,
+        rect=(r.left, r.top, r.right, r.bottom),
+        is_enabled=ena,
+        is_visible=vis,
     )
 
 
-class AccessibilityAutomation:
+def _find_wrapper(win, name: str = "", control_type: str = "",
+                  automation_id: str = "", require_visible: bool = True):
     """
-    UIA-based element finder and interactor.
-    All public methods return dicts suitable for tool responses.
+    Walk win.descendants() and return the first matching wrapper.
+    Matching: all provided criteria must match (case-insensitive name).
+    Never calls child_window() — avoids multi-match exceptions entirely.
     """
+    for el in win.descendants():
+        try:
+            if name and el.window_text().strip().lower() != name.strip().lower():
+                # also accept partial match via best_match-style contains
+                if name.strip().lower() not in el.window_text().strip().lower():
+                    continue
+            if control_type and el.friendly_class_name() != control_type:
+                continue
+            try:
+                if automation_id and el.automation_id() != automation_id:
+                    continue
+            except Exception:
+                if automation_id:
+                    continue
+            if require_visible and not el.is_visible():
+                continue
+            return el
+        except Exception:
+            continue
+    return None
 
-    # ------------------------------------------------------------------ #
-    # Tree inspection
-    # ------------------------------------------------------------------ #
+
+# ── main class ────────────────────────────────────────────────────────────────
+
+class AccessibilityAutomation:
 
     def get_ui_tree(self, window_title: str, depth: int = 4) -> dict:
-        """
-        Dump the accessibility tree of a window up to `depth` levels.
-        Useful for the AI to understand what named elements are available
-        before deciding which one to interact with.
-        """
-        err = _require_pywinauto()
+        err = _require()
         if err:
             return {"error": err}
         try:
-            win = _get_app_window(window_title)
+            win = _get_win(window_title)
             win.wait("visible", timeout=5)
-            tree = _dump_tree(win.wrapper_object(), depth=depth, current=0)
+            tree = _dump_tree(win.wrapper_object(), depth, 0)
             return {"window": window_title, "tree": tree}
         except Exception as e:
-            log.error("get_ui_tree failed for '%s': %s", window_title, e)
+            log.error("get_ui_tree '%s': %s", window_title, e)
+            return {"error": str(e)}
+
+    def list_interactive_elements(self, window_title: str) -> dict:
+        err = _require()
+        if err:
+            return {"error": err}
+        TYPES = {"Button","Edit","CheckBox","RadioButton","ComboBox",
+                 "Hyperlink","ListItem","MenuItem","TabItem","Document","Custom"}
+        try:
+            win = _get_win(window_title)
+            win.wait("visible", timeout=5)
+            out = []
+            for el in win.descendants():
+                try:
+                    if el.friendly_class_name() not in TYPES:
+                        continue
+                    if not el.is_visible():
+                        continue
+                    ui = _wrap_to_ui(el)
+                    out.append({"name": ui.name, "type": ui.control_type,
+                                "automation_id": ui.automation_id,
+                                "center_x": ui.center_x, "center_y": ui.center_y})
+                except Exception:
+                    continue
+            return {"window": window_title, "count": len(out), "elements": out}
+        except Exception as e:
+            log.error("list_interactive_elements '%s': %s", window_title, e)
             return {"error": str(e)}
 
     def find_element(self, window_title: str, name: str = "",
                      control_type: str = "", automation_id: str = "") -> dict:
-        """
-        Find a single UI element by name, control_type, or automationId.
-        Returns its exact screen coordinates and rect.
-        At least one of name / control_type / automation_id must be provided.
-        """
-        err = _require_pywinauto()
+        err = _require()
         if err:
             return {"error": err}
         if not any([name, control_type, automation_id]):
             return {"error": "Provide at least one of: name, control_type, automation_id"}
         try:
-            win = _get_app_window(window_title)
+            win = _get_win(window_title)
             win.wait("visible", timeout=5)
-
-            kwargs = {"top_level_only": False}
-            if name:
-                kwargs["title"] = name
-            if control_type:
-                kwargs["control_type"] = control_type
-            if automation_id:
-                kwargs["auto_id"] = automation_id
-
-            el = win.child_window(**kwargs)
-            el.wait("visible", timeout=5)
-            ui = _element_to_ui(el.wrapper_object())
-            return {
-                "found": True,
-                "name": ui.name,
-                "control_type": ui.control_type,
-                "automation_id": ui.automation_id,
-                "center_x": ui.center_x,
-                "center_y": ui.center_y,
-                "rect": list(ui.rect),
-                "is_enabled": ui.is_enabled,
-                "is_visible": ui.is_visible,
-            }
+            wrapper = _find_wrapper(win, name, control_type, automation_id)
+            if wrapper is None:
+                return {"found": False, "error": f"Not found: {name or automation_id or control_type}"}
+            ui = _wrap_to_ui(wrapper)
+            return {"found": True, "name": ui.name, "control_type": ui.control_type,
+                    "automation_id": ui.automation_id, "center_x": ui.center_x,
+                    "center_y": ui.center_y, "rect": list(ui.rect),
+                    "is_enabled": ui.is_enabled, "is_visible": ui.is_visible}
         except Exception as e:
-            log.warning("find_element '%s' in '%s': %s", name or automation_id, window_title, e)
+            log.warning("find_element '%s' in '%s': %s", name, window_title, e)
             return {"found": False, "error": str(e)}
 
     def click_element(self, window_title: str, name: str = "",
                       control_type: str = "", automation_id: str = "") -> dict:
-        """
-        Find a UI element and click it using its exact center coordinates.
-        Much more reliable than guessing pixel positions from a screenshot.
-        """
-        err = _require_pywinauto()
+        err = _require()
         if err:
             return {"error": err}
         try:
-            win = _get_app_window(window_title)
+            win = _get_win(window_title)
             win.wait("visible", timeout=5)
-
-            kwargs = {"top_level_only": False}
-            if name:
-                kwargs["title"] = name
-            if control_type:
-                kwargs["control_type"] = control_type
-            if automation_id:
-                kwargs["auto_id"] = automation_id
-
-            el = win.child_window(**kwargs)
-            el.wait("enabled visible", timeout=5)
-            wrapper = el.wrapper_object()
-            ui = _element_to_ui(wrapper)
-
-            # Prefer UIA Invoke pattern (fires the element's default action)
-            # — works even if the element is partially off-screen
+            wrapper = _find_wrapper(win, name, control_type, automation_id)
+            if wrapper is None:
+                return {"success": False, "error": f"Not found: {name or automation_id}"}
+            ui = _wrap_to_ui(wrapper)
             try:
                 wrapper.invoke()
-                log.info("click_element (invoke): '%s' in '%s'", ui.name, window_title)
-                return {"success": True, "method": "invoke",
-                        "name": ui.name, "center_x": ui.center_x, "center_y": ui.center_y}
+                log.info("click_element invoke '%s'", ui.name)
+                return {"success": True, "method": "invoke", "name": ui.name,
+                        "center_x": ui.center_x, "center_y": ui.center_y}
             except Exception:
                 pass
-
-            # Fallback: click via exact rect center
             wrapper.click_input()
             time.sleep(0.2)
-            log.info("click_element (click_input): '%s' at (%d,%d)", ui.name, ui.center_x, ui.center_y)
-            return {"success": True, "method": "click_input",
-                    "name": ui.name, "center_x": ui.center_x, "center_y": ui.center_y}
+            log.info("click_element click_input '%s' (%d,%d)", ui.name, ui.center_x, ui.center_y)
+            return {"success": True, "method": "click_input", "name": ui.name,
+                    "center_x": ui.center_x, "center_y": ui.center_y}
         except Exception as e:
-            log.error("click_element failed '%s': %s", name or automation_id, e)
+            log.error("click_element '%s': %s", name, e)
             return {"success": False, "error": str(e)}
 
     def type_in_element(self, window_title: str, text: str,
                         name: str = "", control_type: str = "",
                         automation_id: str = "") -> dict:
-        """
-        Focus a text input element and type into it — no pixel clicking needed.
-        Clears existing content first, then types the new text.
-        Works with: Edit, Document, ComboBox, RichEdit controls.
-        """
-        err = _require_pywinauto()
+        err = _require()
         if err:
             return {"error": err}
         try:
-            win = _get_app_window(window_title)
+            win = _get_win(window_title)
             win.wait("visible", timeout=5)
-
-            kwargs = {"top_level_only": False}
-            if name:
-                kwargs["title"] = name
-            if control_type:
-                kwargs["control_type"] = control_type
-            if automation_id:
-                kwargs["auto_id"] = automation_id
-
-            el = win.child_window(**kwargs)
-            el.wait("enabled visible", timeout=5)
-            wrapper = el.wrapper_object()
-            ui = _element_to_ui(wrapper)
-
-            # Try UIA SetValue pattern first (instant, no keyboard simulation)
+            wrapper = _find_wrapper(win, name, control_type, automation_id)
+            if wrapper is None:
+                return {"success": False, "error": f"Not found: {name or automation_id}"}
+            ui = _wrap_to_ui(wrapper)
             try:
                 wrapper.set_edit_text(text)
-                log.info("type_in_element (set_edit_text): %d chars into '%s'", len(text), ui.name)
+                log.info("type_in_element set_edit_text %d chars -> '%s'", len(text), ui.name)
                 return {"success": True, "method": "set_value",
                         "element": ui.name, "chars": len(text)}
             except Exception:
                 pass
-
-            # Fallback: click to focus, select all, type
             wrapper.click_input()
             time.sleep(0.15)
-            import pyautogui
+            import pyautogui, pyperclip
             pyautogui.hotkey("ctrl", "a")
             time.sleep(0.1)
-            import pyperclip
             pyperclip.copy(text)
             pyautogui.hotkey("ctrl", "v")
             time.sleep(0.2)
-            log.info("type_in_element (paste fallback): %d chars into '%s'", len(text), ui.name)
+            log.info("type_in_element paste %d chars -> '%s'", len(text), ui.name)
             return {"success": True, "method": "paste",
                     "element": ui.name, "chars": len(text)}
         except Exception as e:
-            log.error("type_in_element failed '%s': %s", name or automation_id, e)
+            log.error("type_in_element '%s': %s", name, e)
             return {"success": False, "error": str(e)}
 
     def focus_element(self, window_title: str, name: str = "",
                       control_type: str = "", automation_id: str = "") -> dict:
-        """
-        Set keyboard focus to a UI element without clicking it.
-        Useful for making a text field active before typing.
-        """
-        err = _require_pywinauto()
+        err = _require()
         if err:
             return {"error": err}
         try:
-            win = _get_app_window(window_title)
+            win = _get_win(window_title)
             win.wait("visible", timeout=5)
-
-            kwargs = {"top_level_only": False}
-            if name:
-                kwargs["title"] = name
-            if control_type:
-                kwargs["control_type"] = control_type
-            if automation_id:
-                kwargs["auto_id"] = automation_id
-
-            el = win.child_window(**kwargs)
-            el.wait("enabled visible", timeout=5)
-            wrapper = el.wrapper_object()
+            wrapper = _find_wrapper(win, name, control_type, automation_id)
+            if wrapper is None:
+                return {"success": False, "error": f"Not found: {name or automation_id}"}
             wrapper.set_focus()
-            ui = _element_to_ui(wrapper)
-            log.info("focus_element: '%s' in '%s'", ui.name, window_title)
+            ui = _wrap_to_ui(wrapper)
             return {"success": True, "element": ui.name,
                     "center_x": ui.center_x, "center_y": ui.center_y}
         except Exception as e:
-            log.error("focus_element failed: %s", e)
+            log.error("focus_element '%s': %s", name, e)
             return {"success": False, "error": str(e)}
 
     def get_element_value(self, window_title: str, name: str = "",
                           control_type: str = "", automation_id: str = "") -> dict:
-        """
-        Read the current text/value of a UI element.
-        Useful for verifying a field was filled correctly.
-        """
-        err = _require_pywinauto()
+        err = _require()
         if err:
             return {"error": err}
         try:
-            win = _get_app_window(window_title)
+            win = _get_win(window_title)
             win.wait("visible", timeout=5)
-
-            kwargs = {"top_level_only": False}
-            if name:
-                kwargs["title"] = name
-            if control_type:
-                kwargs["control_type"] = control_type
-            if automation_id:
-                kwargs["auto_id"] = automation_id
-
-            el = win.child_window(**kwargs)
-            wrapper = el.wrapper_object()
-            value = wrapper.window_text() or ""
-            return {"success": True, "value": value}
+            wrapper = _find_wrapper(win, name, control_type, automation_id)
+            if wrapper is None:
+                return {"success": False, "error": f"Not found: {name or automation_id}"}
+            return {"success": True, "value": wrapper.window_text() or ""}
         except Exception as e:
-            log.error("get_element_value failed: %s", e)
+            log.error("get_element_value '%s': %s", name, e)
             return {"success": False, "error": str(e)}
 
-    def list_interactive_elements(self, window_title: str) -> dict:
-        """
-        List all interactive elements (buttons, inputs, links, checkboxes)
-        in a window with their names and exact coordinates.
-        Use this when you need to find what's clickable without dumping the full tree.
-        """
-        err = _require_pywinauto()
-        if err:
-            return {"error": err}
 
-        INTERACTIVE_TYPES = {
-            "Button", "Edit", "CheckBox", "RadioButton", "ComboBox",
-            "Hyperlink", "ListItem", "MenuItem", "TabItem", "ToolBar",
-            "Document", "Custom",
-        }
-        try:
-            win = _get_app_window(window_title)
-            win.wait("visible", timeout=5)
-            elements = []
-            for el in win.descendants():
-                try:
-                    ct = el.friendly_class_name()
-                    if ct not in INTERACTIVE_TYPES:
-                        continue
-                    ui = _element_to_ui(el)
-                    if not ui.is_visible:
-                        continue
-                    elements.append({
-                        "name": ui.name,
-                        "type": ui.control_type,
-                        "automation_id": ui.automation_id,
-                        "center_x": ui.center_x,
-                        "center_y": ui.center_y,
-                    })
-                except Exception:
-                    continue
-            return {"window": window_title, "count": len(elements), "elements": elements}
-        except Exception as e:
-            log.error("list_interactive_elements failed for '%s': %s", window_title, e)
-            return {"error": str(e)}
-
-
-# ---------------------------------------------------------------------------
-# Internal tree dumper
-# ---------------------------------------------------------------------------
+# ── tree dumper ───────────────────────────────────────────────────────────────
 
 def _dump_tree(wrapper, depth: int, current: int) -> list:
     if current >= depth:
         return []
-    result = []
+    out = []
     try:
         children = wrapper.children()
     except Exception:
         return []
     for child in children:
         try:
-            node = {
-                "name": child.window_text() or "",
-                "type": child.friendly_class_name() or "",
-                "enabled": child.is_enabled(),
-            }
+            node = {"name": child.window_text() or "",
+                    "type": child.friendly_class_name() or ""}
+            try:
+                node["enabled"] = child.is_enabled()
+            except Exception:
+                pass
             try:
                 r = child.rectangle()
-                node["center"] = [(r.left + r.right) // 2, (r.top + r.bottom) // 2]
+                node["center"] = [(r.left+r.right)//2, (r.top+r.bottom)//2]
             except Exception:
                 pass
             try:
@@ -389,7 +303,7 @@ def _dump_tree(wrapper, depth: int, current: int) -> list:
             sub = _dump_tree(child, depth, current + 1)
             if sub:
                 node["children"] = sub
-            result.append(node)
+            out.append(node)
         except Exception:
             continue
-    return result
+    return out

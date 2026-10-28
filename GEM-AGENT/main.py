@@ -29,6 +29,7 @@ def main():
     from desktop.task_runner import TaskRunner
     from tools.registry import build_desktop_registry
     from ui.app import App
+    from ui.cursor_overlay import CursorOverlay
 
     # Build engines
     audio_in = AudioInput(config.audio)
@@ -61,10 +62,16 @@ def main():
         f"Screenshots are {_sw}x{_sh} pixels — same as real screen. Coordinates are 1:1.\n"
         "Before clicking anything, identify the element's CENTER pixel from the screenshot.\n\n"
 
-        "TOOLS:\n"
+        "TOOLS — PIXEL-BASED (fallback for games/custom UIs):\n"
         "move_cursor, click, double_click, scroll, type_text, hotkey, press_key,\n"
         "focus_window, launch_app, open_url, navigate_to, take_screenshot, get_cursor_position,\n"
         "close_window, minimize_window, maximize_window, restore_window\n\n"
+
+        "TOOLS — ACCESSIBILITY/UIA (PREFERRED — no pixel guessing):\n"
+        "list_interactive_elements, get_ui_tree, find_element,\n"
+        "click_element, type_in_element, focus_element, get_element_value\n"
+        "Use UIA tools FIRST whenever you need to click buttons or type in text fields.\n"
+        "Example: type_in_element('Discord', 'Hello!', name='Message Input')\n\n"
 
         "OPENING APPLICATIONS — CRITICAL:\n"
         "ALWAYS use launch_app('chrome') to open Chrome, NOT clicking the taskbar.\n"
@@ -105,6 +112,67 @@ def main():
     )
 
     app = App(config=config, session=session, task_runner=runner)
+
+    # CursorOverlay must be created after Tk root exists.
+    # Patch App.run to initialise overlay on the Tk thread, then wire
+    # runner events to drive it.
+    _orig_run = app.run
+
+    def _run_with_overlay():
+        import re as _re
+        overlay = CursorOverlay()
+
+        # Wrap the runner's on_event so cursor follows pixel-based click/move
+        _base_evt = runner.on_event
+
+        def _evt_hook(evt):
+            act = evt.action
+            if act in ("click", "double_click", "move_cursor"):
+                m = _re.search(r"\((\d+),\s*(\d+)\)", evt.detail)
+                if m:
+                    x, y = int(m.group(1)), int(m.group(2))
+                    overlay.show(x, y)
+                    if act in ("click", "double_click"):
+                        overlay.click_effect()
+            # UIA actions embed center_x/center_y in detail as "at (X, Y)"
+            elif act in ("click_element", "type_in_element", "focus_element"):
+                m = _re.search(r"center_x[=:\s]+(\d+).*?center_y[=:\s]+(\d+)",
+                               evt.detail)
+                if not m:
+                    m = _re.search(r"at \((\d+),\s*(\d+)\)", evt.detail)
+                if m:
+                    x, y = int(m.group(1)), int(m.group(2))
+                    overlay.show(x, y)
+                    if act in ("click_element",):
+                        overlay.click_effect()
+            _base_evt(evt)
+
+        runner.on_event = _evt_hook
+
+        # Also inject overlay into accessibility layer so UIA clicks show cursor
+        try:
+            from desktop.accessibility import AccessibilityAutomation
+            _orig_click_el = AccessibilityAutomation.click_element
+
+            def _patched_click_el(self_acc, window_title, name="",
+                                  control_type="", automation_id=""):
+                result = _orig_click_el(self_acc, window_title, name,
+                                        control_type, automation_id)
+                if result.get("success"):
+                    cx = result.get("center_x")
+                    cy = result.get("center_y")
+                    if cx and cy:
+                        overlay.show(int(cx), int(cy))
+                        overlay.click_effect()
+                return result
+
+            AccessibilityAutomation.click_element = _patched_click_el
+        except Exception:
+            pass
+
+        _orig_run()
+
+    app.run = _run_with_overlay
     app.run()
 
 

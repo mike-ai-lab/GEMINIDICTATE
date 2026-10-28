@@ -1,15 +1,34 @@
 """
-ui/app.py — Floating always-on-top GEM-AGENT widget.
+ui/app.py — GEM-AGENT floating widget.
 
-Draggable, minimizable, always-on-top.
-Zero business logic — only displays state and calls session.start/stop.
-All session callbacks arrive from asyncio thread → marshalled via root.after(0,...).
+Single scrollable body. No quote box. Layout:
+
+  ┌──────────────────────────────────────┐
+  │ ⠿  ● AGENT  CONTEXT CONTROL  [×][^] │  header (drag handle)
+  ├──────────────────────────────────────┤
+  │ ● LISTENING...                       │  status strip
+  ├──────────────────────────────────────┤
+  │                                      │
+  │  🤖 AGENT  Executing…     Step N     │  ← scrollable area starts
+  │  ║ ⠙  action step text…             │
+  │  ║ ✔  action step text…             │
+  │  ┌── completion (green, if done) ──┐ │
+  │  │ ✔ Task completed.               │ │
+  │  └─────────────────────────────────┘ │
+  │                                      │
+  │  YOU  message text…                  │
+  │   AI  response text…                 │
+  │  ─── meter ───                       │  ← scrollable area ends
+  ├──────────────────────────────────────┤
+  │  [ Type a task…………………… ] [▶]         │  footer — always visible
+  │  [ Connect ]  [ Disconnect ]         │
+  └──────────────────────────────────────┘
 """
 
 import asyncio
 import threading
+import time as _time
 import tkinter as tk
-from tkinter import font as tkfont
 
 from logger import get_logger
 from config import AppConfig
@@ -17,385 +36,398 @@ from desktop.task_runner import ActionEvent, TaskState
 
 log = get_logger(__name__)
 
-_STATUS_MAP = {
-    "connected": "● CONNECTED — speak to begin",
-    "disconnected": "○ DISCONNECTED",
-    "turn_complete": "● LISTENING...",
-    "interrupted": "● LISTENING...",
-    "token_warning": "● CONNECTED — high token usage",
+BG     = "#050a14"
+PANEL  = "#0b1120"
+HDR    = "#07101e"
+LINE   = "#1a2744"
+ACCENT = "#00f3ff"
+VIOLET = "#a855f7"
+GREEN  = "#34d399"
+GRN_DK = "#042e1e"
+ROSE   = "#fb7185"
+AMBER  = "#fbbf24"
+TEXT   = "#e2e8f0"
+DIM    = "#3a5070"
+MID    = "#7a9ab8"
+BTNFG  = "#001a1f"
+
+_STATUS = {
+    "connected":     ("● CONNECTED — listening", ACCENT),
+    "disconnected":  ("○  DISCONNECTED",          DIM),
+    "turn_complete": ("● LISTENING...",            ACCENT),
+    "interrupted":   ("● LISTENING...",            ACCENT),
+    "token_warning": ("⚠  HIGH TOKEN USAGE",       AMBER),
 }
 
 
 class App:
+    W      = 380
+    H_FULL = 620
+    H_MINI = 52
+
     def __init__(self, config: AppConfig, session, task_runner=None):
-        self._cfg = config
-        self._session = session
-        self._runner = task_runner
+        self._cfg       = config
+        self._session   = session
+        self._runner    = task_runner
         self._loop: asyncio.AbstractEventLoop | None = None
         self._connected = False
-        self._minimized = False
-        self._transcript_buf: dict[str, list[str]] = {"user": [], "ai": []}
-        self._screen_timer_id = None
-        # Build the observer once — excludes this widget from all captures
+        self._collapsed = False
+        self._stid      = None   # screen loop timer id
+        self._txbuf: dict[str, list[str]] = {"user": [], "ai": []}
+        self._rows: list[StepRow] = []
+        self._dx = self._dy = 0
+
         import os
         from desktop.observer import ScreenObserver
-        _debug_dir = os.path.join(
-            os.path.dirname(os.path.abspath(__file__)),
-            "..", "logs", "frames"
-        )
-        self._observer = ScreenObserver(
+        self._obs = ScreenObserver(
             config.desktop,
             exclude_titles=["GEM-AGENT"],
-            debug_dir=_debug_dir,
+            debug_dir=os.path.join(
+                os.path.dirname(os.path.abspath(__file__)),
+                "..", "logs", "frames"),
         )
 
-        c = config.ui
         self._root = tk.Tk()
         self._root.title(config.app_name)
-        self._root.geometry(f"{c.window_width}x{c.window_height}+{self._screen_right()}+80")
-        self._root.configure(bg=c.bg_color)
+        self._root.configure(bg=BG)
         self._root.resizable(False, False)
-        self._root.attributes("-topmost", c.always_on_top)
-        self._root.overrideredirect(True)   # borderless — we draw our own chrome
+        self._root.attributes("-topmost", config.ui.always_on_top)
+        self._root.overrideredirect(True)
+        self._root.geometry(f"{self.W}x{self.H_FULL}+{self._rx()}+60")
+        self._build()
+        self._wire()
 
-        self._build_ui()
-        self._wire_session()
-        self._root.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._setup_drag()
+    def _rx(self):
+        return self._root.winfo_screenwidth() - self.W - 18
 
-    def _screen_right(self) -> int:
-        sw = self._root.winfo_screenwidth()
-        return sw - self._cfg.ui.window_width - 22
+    # ─────────────────────────────────────────────────────────────────────
+    # BUILD
+    # ─────────────────────────────────────────────────────────────────────
+    def _build(self):
+        # 1-px neon border
+        wrap = tk.Frame(self._root, bg=ACCENT, padx=1, pady=1)
+        wrap.pack(fill=tk.BOTH, expand=True)
+        shell = tk.Frame(wrap, bg=BG)
+        shell.pack(fill=tk.BOTH, expand=True)
 
-    # ------------------------------------------------------------------ #
-    # UI Construction
-    # ------------------------------------------------------------------ #
+        # ── HEADER ────────────────────────────────────────────────────────
+        self._hdr = tk.Frame(shell, bg=HDR, height=52)
+        self._hdr.pack(fill=tk.X)
+        self._hdr.pack_propagate(False)
 
-    def _build_ui(self):
-        c = self._cfg.ui
-        mono = (c.font_mono, c.font_size)
-        mono_sm = (c.font_mono, c.font_size - 1)
-        ui_font = (c.font_ui, c.font_size)
+        tk.Label(self._hdr, text="⠿", bg=HDR, fg=DIM,
+                 font=("Segoe UI", 14)).pack(side=tk.LEFT, padx=(10, 4))
 
-        BG = c.bg_color
-        PANEL = "#080e19"
-        LINE = "#1e2d3d"
-        CYAN = c.accent_color
-        VIOLET = c.ai_color
-        TEXT = c.text_color
-        DIM = "#52677e"
-        GREEN = c.green_color
-        ROSE = c.error_color
-        AMBER = c.amber_color
+        dv = tk.Canvas(self._hdr, width=12, height=12,
+                       bg=HDR, highlightthickness=0)
+        dv.pack(side=tk.LEFT)
+        self._dot = dv.create_oval(2, 2, 10, 10, fill=DIM, outline="")
+        self._dv  = dv
 
-        # ---- Title bar / drag handle ----
-        self._titlebar = tk.Frame(self._root, bg=PANEL, height=42)
-        self._titlebar.pack(fill=tk.X)
-        self._titlebar.pack_propagate(False)
+        tk.Label(self._hdr, text=" AGENT", bg=HDR, fg=ACCENT,
+                 font=("Segoe UI", 10, "bold")).pack(side=tk.LEFT)
+        tk.Label(self._hdr, text="  CONTEXT CONTROL", bg=HDR, fg=MID,
+                 font=("Segoe UI", 9)).pack(side=tk.LEFT)
 
-        dot_frame = tk.Frame(self._titlebar, bg=PANEL)
-        dot_frame.pack(side=tk.LEFT, padx=(10, 0))
-        self._status_dot = tk.Canvas(dot_frame, width=8, height=8, bg=PANEL, highlightthickness=0)
-        self._status_dot.pack()
-        self._dot_oval = self._status_dot.create_oval(1, 1, 7, 7, fill=DIM, outline="")
+        self._bcol = tk.Button(self._hdr, text="∧", bg="#1a2744", fg=MID,
+                               relief=tk.FLAT, font=("Segoe UI", 11, "bold"),
+                               cursor="hand2", command=self._toggle_col,
+                               padx=10, pady=2, bd=0)
+        self._bcol.pack(side=tk.RIGHT, padx=(0, 8))
+        tk.Button(self._hdr, text="×", bg=HDR, fg=DIM,
+                  relief=tk.FLAT, font=("Segoe UI", 13),
+                  cursor="hand2", command=self._on_close,
+                  bd=0).pack(side=tk.RIGHT, padx=(0, 2))
 
-        tk.Label(
-            self._titlebar, text=f"  {config_app_name(self._cfg)}",
-            bg=PANEL, fg=TEXT, font=(c.font_mono, 10, "bold"),
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        # bind drag on header and all children — done after all children packed
+        self._root.after(0, self._bind_drag)
 
-        tk.Label(self._titlebar, text="DESKTOP CONTROL", bg=PANEL, fg=DIM,
-                 font=(c.font_mono, 7)).pack(side=tk.LEFT, padx=(4, 0))
+        tk.Frame(shell, bg=LINE, height=1).pack(fill=tk.X)
 
-        # Minimize / close buttons
-        btn_frame = tk.Frame(self._titlebar, bg=PANEL)
-        btn_frame.pack(side=tk.RIGHT, padx=8)
-        self._btn_min = tk.Button(
-            btn_frame, text="−", bg=PANEL, fg=DIM,
-            relief=tk.FLAT, font=(c.font_mono, 11), cursor="hand2",
-            command=self._toggle_minimize,
-        )
-        self._btn_min.pack(side=tk.LEFT, padx=2)
-        tk.Button(
-            btn_frame, text="×", bg=PANEL, fg=DIM,
-            relief=tk.FLAT, font=(c.font_mono, 11), cursor="hand2",
-            command=self._on_close,
-        ).pack(side=tk.LEFT, padx=2)
+        # ── STATUS STRIP ──────────────────────────────────────────────────
+        self._lst = tk.Label(shell, text="○  DISCONNECTED",
+                             bg=HDR, fg=DIM, font=("Consolas", 8),
+                             anchor="w", padx=12, pady=5)
+        self._lst.pack(fill=tk.X)
+        tk.Frame(shell, bg=LINE, height=1).pack(fill=tk.X)
 
-        sep = lambda: tk.Frame(self._root, bg=LINE, height=1)
+        # ── SCROLLABLE BODY ───────────────────────────────────────────────
+        self._scroll_frame = tk.Frame(shell, bg=BG)
+        self._scroll_frame.pack(fill=tk.BOTH, expand=True)
 
-        # ---- Body (hidden when minimized) ----
-        self._body = tk.Frame(self._root, bg=BG)
-        self._body.pack(fill=tk.BOTH, expand=True)
+        self._cv = tk.Canvas(self._scroll_frame, bg=BG,
+                             highlightthickness=0, bd=0)
+        sb = tk.Scrollbar(self._scroll_frame, orient="vertical",
+                          command=self._cv.yview, width=6)
+        self._cv.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self._cv.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # Status line
-        sep().pack(fill=tk.X)
-        self._lbl_status = tk.Label(
-            self._body, text="○ DISCONNECTED",
-            bg=PANEL, fg=DIM, font=mono_sm, anchor="w", padx=10, pady=5,
-        )
-        self._lbl_status.pack(fill=tk.X)
+        self._inner = tk.Frame(self._cv, bg=BG)
+        self._win_id = self._cv.create_window(
+            (0, 0), window=self._inner, anchor="nw")
 
-        # Thought / current action line
-        sep().pack(fill=tk.X)
-        self._lbl_thought = tk.Label(
-            self._body, text="Give me a task. I will operate the desktop and report verified results.",
-            bg="#0a1220", fg="#a5b6ca", font=mono_sm, anchor="w", padx=10, pady=7,
-            wraplength=self._cfg.ui.window_width - 20, justify=tk.LEFT,
-        )
-        self._lbl_thought.pack(fill=tk.X)
+        self._inner.bind("<Configure>",
+            lambda e: self._cv.configure(
+                scrollregion=self._cv.bbox("all")))
+        self._cv.bind("<Configure>",
+            lambda e: self._cv.itemconfig(self._win_id, width=e.width))
+        self._cv.bind_all("<MouseWheel>",
+            lambda e: self._cv.yview_scroll(
+                int(-1*(e.delta/120)), "units"))
 
-        # Task steps frame
-        sep().pack(fill=tk.X)
-        self._steps_frame = tk.Frame(self._body, bg=BG)
-        self._steps_frame.pack(fill=tk.X, padx=10, pady=(6, 2))
-        self._task_title_lbl = tk.Label(
-            self._steps_frame, text="ACTIVE TASK", bg=BG, fg=DIM,
-            font=(c.font_mono, 7, "bold"), anchor="w",
-        )
-        self._task_title_lbl.pack(fill=tk.X)
-        self._task_progress_lbl = tk.Label(
-            self._steps_frame, text="", bg=BG, fg=GREEN,
-            font=mono_sm, anchor="w",
-        )
-        self._task_progress_lbl.pack(fill=tk.X)
+        self._build_inner()
 
-        # Transcript
-        sep().pack(fill=tk.X)
-        t_frame = tk.Frame(self._body, bg=BG)
-        t_frame.pack(fill=tk.X, padx=0)
-        self._transcript = tk.Text(
-            t_frame, height=6, bg="#070c15", fg=TEXT,
-            font=mono_sm, relief=tk.FLAT, wrap=tk.WORD,
-            padx=10, pady=6, state=tk.DISABLED, cursor="arrow",
-        )
-        self._transcript.pack(fill=tk.X)
-        self._transcript.tag_config("you", foreground=CYAN, font=(c.font_mono, c.font_size, "bold"))
-        self._transcript.tag_config("ai", foreground=VIOLET, font=(c.font_mono, c.font_size, "bold"))
-        self._transcript.tag_config("sys", foreground=AMBER, font=(c.font_mono, c.font_size, "bold"))
-        self._transcript.tag_config("text", foreground=TEXT)
+        # ── FOOTER — always visible ────────────────────────────────────────
+        tk.Frame(shell, bg=LINE, height=1).pack(fill=tk.X, side=tk.BOTTOM)
+        self._foot = tk.Frame(shell, bg=HDR)
+        self._foot.pack(fill=tk.X, side=tk.BOTTOM)
+        foot = self._foot
 
-        # Action log
-        sep().pack(fill=tk.X)
-        self._log = tk.Text(
-            self._body, height=4, bg="#050911", fg=DIM,
-            font=(c.font_mono, 8), relief=tk.FLAT, padx=10, pady=5,
-            state=tk.DISABLED, cursor="arrow",
-        )
-        self._log.pack(fill=tk.X)
-        self._log.tag_config("ok", foreground=GREEN)
-        self._log.tag_config("act", foreground=AMBER)
-        self._log.tag_config("err", foreground=ROSE)
-        self._log.tag_config("ts", foreground="#364d62")
+        ir = tk.Frame(foot, bg=HDR, pady=8)
+        ir.pack(fill=tk.X)
+        self._inp = tk.Entry(ir, bg="#0d1a2e", fg=TEXT,
+                             insertbackground=ACCENT, relief=tk.FLAT,
+                             font=("Segoe UI", 10),
+                             highlightthickness=1,
+                             highlightbackground=LINE,
+                             highlightcolor=ACCENT)
+        self._inp.pack(side=tk.LEFT, fill=tk.X, expand=True,
+                       padx=(10, 6), ipady=7)
+        self._inp.insert(0, "Type a task…")
+        self._inp.bind("<FocusIn>", lambda e: (
+            self._inp.delete(0, tk.END)
+            if self._inp.get() == "Type a task…" else None))
+        self._inp.bind("<Return>", lambda e: self._send())
 
-        # Audio meter
-        sep().pack(fill=tk.X)
-        self._meter = tk.Canvas(self._body, height=4, bg="#050911", highlightthickness=0)
-        self._meter.pack(fill=tk.X)
-        self._meter_bar = self._meter.create_rectangle(0, 0, 0, 4, fill=CYAN, outline="")
+        tk.Button(ir, text="▶", bg=ACCENT, fg=BTNFG,
+                  relief=tk.FLAT, font=("Segoe UI", 12, "bold"),
+                  cursor="hand2", command=self._send,
+                  padx=10, pady=4, bd=0).pack(side=tk.LEFT, padx=(0, 10))
 
-        # Input row
-        sep().pack(fill=tk.X)
-        inp_frame = tk.Frame(self._body, bg=PANEL, pady=7)
-        inp_frame.pack(fill=tk.X)
-        self._input = tk.Entry(
-            inp_frame, bg="#0e1725", fg=TEXT, insertbackground=CYAN,
-            relief=tk.FLAT, font=mono, highlightthickness=1,
-            highlightbackground=LINE, highlightcolor=CYAN,
-        )
-        self._input.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(8, 4), ipady=5)
-        self._input.bind("<Return>", lambda e: self._on_send())
-        self._input.insert(0, "Type a task or interrupt the agent…")
-        self._input.bind("<FocusIn>", self._clear_placeholder)
+        tk.Frame(foot, bg=LINE, height=1).pack(fill=tk.X)
+        cr = tk.Frame(foot, bg=HDR, pady=8)
+        cr.pack(fill=tk.X)
+        self._bconn = tk.Button(cr, text="Connect", bg=ACCENT, fg=BTNFG,
+                                relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+                                cursor="hand2", command=self._on_conn,
+                                padx=16, pady=5, bd=0)
+        self._bconn.pack(side=tk.LEFT, padx=(10, 6))
+        self._bdisc = tk.Button(cr, text="Disconnect", bg=HDR, fg=ROSE,
+                                relief=tk.FLAT, font=("Segoe UI", 9, "bold"),
+                                cursor="hand2", command=self._on_disc,
+                                padx=16, pady=5, bd=0, state=tk.DISABLED)
+        self._bdisc.pack(side=tk.LEFT)
 
-        self._btn_send = tk.Button(
-            inp_frame, text="→", bg=CYAN, fg="#00171b", relief=tk.FLAT,
-            font=(c.font_mono, 11, "bold"), cursor="hand2", command=self._on_send,
-        )
-        self._btn_send.pack(side=tk.LEFT, padx=(0, 4), ipady=3, ipadx=4)
+    def _build_inner(self):
+        p = {"padx": 10, "pady": (10, 0)}
 
-        # Connect / Disconnect
-        sep().pack(fill=tk.X)
-        ctrl_frame = tk.Frame(self._body, bg=PANEL, pady=7)
-        ctrl_frame.pack(fill=tk.X)
-        self._btn_connect = tk.Button(
-            ctrl_frame, text="Connect", bg=CYAN, fg="#00171b", relief=tk.FLAT,
-            font=(c.font_mono, 9, "bold"), cursor="hand2", command=self._on_connect,
-            padx=10, pady=4,
-        )
-        self._btn_connect.pack(side=tk.LEFT, padx=(8, 4))
-        self._btn_disconnect = tk.Button(
-            ctrl_frame, text="Disconnect", bg=PANEL, fg=ROSE, relief=tk.FLAT,
-            font=(c.font_mono, 9, "bold"), cursor="hand2", command=self._on_disconnect,
-            padx=10, pady=4, state=tk.DISABLED,
-        )
-        self._btn_disconnect.pack(side=tk.LEFT, padx=4)
+        # ── AGENT LOG CARD ────────────────────────────────────────────────
+        lcard = tk.Frame(self._inner, bg=PANEL,
+                         highlightthickness=1,
+                         highlightbackground=LINE)
+        lcard.pack(fill=tk.X, **p)
 
-    # ------------------------------------------------------------------ #
-    # Wire session callbacks
-    # ------------------------------------------------------------------ #
+        # card header row
+        lh = tk.Frame(lcard, bg=PANEL)
+        lh.pack(fill=tk.X, padx=12, pady=(10, 6))
+        tk.Label(lh, text="🤖 AGENT", bg=PANEL, fg=ACCENT,
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+        self._lstate = tk.Label(lh, text="Idle", bg=PANEL, fg=DIM,
+                                font=("Segoe UI", 8))
+        self._lstate.pack(side=tk.LEFT, padx=(6, 0))
+        self._lstepn = tk.Label(lh, text="Step 0", bg=PANEL, fg=DIM,
+                                font=("Segoe UI", 8))
+        self._lstepn.pack(side=tk.RIGHT)
 
-    def _wire_session(self):
-        # Use default-arg capture to avoid closure bugs with loop variables
-        self._session.on_transcript = lambda sp, t: self._root.after(0, lambda sp=sp, t=t: self._buf_transcript(sp, t))
-        self._session.on_status = lambda s: self._root.after(0, lambda s=s: self._on_status(s))
-        self._session.on_audio_level = lambda rms: self._root.after(0, lambda rms=rms: self._update_meter(rms))
+        # left accent bar + steps
+        sw = tk.Frame(lcard, bg=PANEL)
+        sw.pack(fill=tk.X, padx=(12, 12), pady=(0, 6))
+        tk.Frame(sw, bg=ACCENT, width=3).pack(side=tk.LEFT, fill=tk.Y)
+        self._sf = tk.Frame(sw, bg=PANEL)
+        self._sf.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(6, 0))
+
+        # completion card (hidden until done)
+        self._compf = tk.Frame(lcard, bg=GRN_DK,
+                               highlightthickness=1,
+                               highlightbackground=GREEN)
+        self._compl = tk.Label(self._compf, text="",
+                               bg=GRN_DK, fg=GREEN,
+                               font=("Segoe UI", 9),
+                               anchor="w", justify=tk.LEFT,
+                               wraplength=self.W - 60,
+                               padx=12, pady=8)
+        self._compl.pack(fill=tk.X)
+        tk.Frame(lcard, bg=PANEL, height=6).pack()
+
+        # ── TRANSCRIPT ────────────────────────────────────────────────────
+        tc = tk.Frame(self._inner, bg=PANEL,
+                      highlightthickness=1, highlightbackground=LINE)
+        tc.pack(fill=tk.X, **p)
+
+        th = tk.Frame(tc, bg=PANEL)
+        th.pack(fill=tk.X, padx=12, pady=(8, 4))
+        tk.Label(th, text="TRANSCRIPT", bg=PANEL, fg=VIOLET,
+                 font=("Segoe UI", 8, "bold")).pack(side=tk.LEFT)
+
+        self._tx = tk.Text(tc, height=5, bg=PANEL, fg=TEXT,
+                           font=("Segoe UI", 9), relief=tk.FLAT,
+                           wrap=tk.WORD, padx=12, pady=4,
+                           state=tk.DISABLED, cursor="arrow")
+        self._tx.pack(fill=tk.X)
+        self._tx.tag_config("you",  foreground=ACCENT,  font=("Segoe UI", 9, "bold"))
+        self._tx.tag_config("ai",   foreground=VIOLET,  font=("Segoe UI", 9, "bold"))
+        self._tx.tag_config("text", foreground=TEXT,    font=("Segoe UI", 9))
+        tk.Frame(tc, bg=PANEL, height=6).pack()
+
+        # ── AUDIO METER ───────────────────────────────────────────────────
+        self._meter = tk.Canvas(self._inner, height=3, bg=BG,
+                                highlightthickness=0)
+        self._meter.pack(fill=tk.X, padx=10, pady=(6, 12))
+        self._mbar = self._meter.create_rectangle(
+            0, 0, 0, 3, fill=ACCENT, outline="")
+
+    # ─────────────────────────────────────────────────────────────────────
+    # STEP LOG
+    # ─────────────────────────────────────────────────────────────────────
+    def _add_step(self, text, done=False, error=False):
+        row = StepRow(self._sf, text, done=done, error=error)
+        self._rows.append(row)
+        if len(self._rows) > 15:
+            self._rows.pop(0).destroy()
+        n = len(self._rows)
+        self._lstepn.config(text=f"Step {n}")
+        self._lstate.config(
+            text="Finished" if done else "Executing…",
+            fg=GREEN if done else ACCENT)
+        self._root.after(50, lambda: self._cv.yview_moveto(1.0))
+        return row
+
+    def _clear_steps(self):
+        for r in self._rows:
+            r.destroy()
+        self._rows.clear()
+        self._lstepn.config(text="Step 0")
+        self._lstate.config(text="Idle", fg=DIM)
+        self._compf.pack_forget()
+
+    def _show_done(self, msg="Task completed successfully."):
+        self._compl.config(text=f"✔  {msg}")
+        self._compf.pack(fill=tk.X, padx=12, pady=(4, 4))
+        self._root.after(80, lambda: self._cv.yview_moveto(1.0))
+
+    # ─────────────────────────────────────────────────────────────────────
+    # WIRE SESSION
+    # ─────────────────────────────────────────────────────────────────────
+    def _wire(self):
+        self._session.on_transcript  = lambda sp, t: self._root.after(
+            0, lambda sp=sp, t=t: self._buftx(sp, t))
+        self._session.on_status      = lambda s: self._root.after(
+            0, lambda s=s: self._onst(s))
+        self._session.on_audio_level = lambda r: self._root.after(
+            0, lambda r=r: self._onrms(r))
         if self._runner:
-            self._runner.on_event = lambda e: self._root.after(0, lambda e=e: self._on_action_event(e))
+            self._runner.on_event = lambda e: self._root.after(
+                0, lambda e=e: self._onev(e))
 
-    # ------------------------------------------------------------------ #
-    # Callbacks
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────────────
+    # CALLBACKS
+    # ─────────────────────────────────────────────────────────────────────
+    def _buftx(self, sp, t):
+        self._txbuf[sp].append(t)
 
-    def _buf_transcript(self, speaker: str, text: str):
-        """Buffer incoming word fragments; flush as complete line on turn_complete."""
-        self._transcript_buf[speaker].append(text)
-
-    def _flush_transcript(self, speaker: str):
-        """Flush buffered fragments as a single joined line."""
-        parts = self._transcript_buf.get(speaker, [])
+    def _flushtx(self, sp):
+        parts = self._txbuf.get(sp, [])
         if not parts:
             return
-        full_text = " ".join(parts).strip()
-        self._transcript_buf[speaker] = []
-        if full_text:
-            self._append_transcript_line(speaker, full_text)
+        full = " ".join(parts).strip()
+        self._txbuf[sp] = []
+        if full:
+            self._apptx(sp, full)
 
-    def _append_transcript_line(self, speaker: str, text: str):
-        log.info("transcript [%s]: %s", speaker, text[:100])
-        t = self._transcript
-        t.config(state=tk.NORMAL)
-        tag = "you" if speaker == "user" else "ai"
-        label = "YOU" if speaker == "user" else " AI"
-        t.insert(tk.END, f"{label}  ", tag)
-        t.insert(tk.END, text + "\n", "text")
-        # Trim to 80 lines
-        lines = int(t.index(tk.END).split(".")[0]) - 1
+    def _apptx(self, sp, t):
+        w = self._tx
+        w.config(state=tk.NORMAL)
+        lbl = "YOU " if sp == "user" else " AI "
+        tag = "you"  if sp == "user" else "ai"
+        w.insert(tk.END, lbl, tag)
+        w.insert(tk.END, t + "\n", "text")
+        lines = int(w.index(tk.END).split(".")[0]) - 1
         if lines > 80:
-            t.delete("1.0", f"{lines - 80}.0")
-        t.see(tk.END)
-        t.config(state=tk.DISABLED)
-        if speaker == "ai":
-            short = text[:120] + ("…" if len(text) > 120 else "")
-            self._lbl_thought.config(text=f"AI: {short}")
+            w.delete("1.0", f"{lines-80}.0")
+        w.see(tk.END)
+        w.config(state=tk.DISABLED)
 
-    def _on_transcript(self, speaker: str, text: str):
-        # Legacy direct call path (unused now but kept for compatibility)
-        self._append_transcript_line(speaker, text)
-
-    def _on_status(self, status: str):
-        c = self._cfg.ui
-        CYAN, DIM, AMBER, ROSE = c.accent_color, "#52677e", c.amber_color, c.error_color
-        display = _STATUS_MAP.get(status, status.upper())
-
-        # Flush buffered transcript words into complete lines
-        if status in ("turn_complete", "interrupted"):
-            self._flush_transcript("user")
-            self._flush_transcript("ai")
-
-        if status == "connected":
-            self._lbl_status.config(text=display, fg=CYAN)
-            self._status_dot_color(CYAN)
-            self._btn_connect.config(state=tk.DISABLED)
-            self._btn_disconnect.config(state=tk.NORMAL)
+    def _onst(self, s):
+        if s in ("turn_complete", "interrupted"):
+            self._flushtx("user")
+            self._flushtx("ai")
+        disp, col = _STATUS.get(s, (s.upper(), DIM))
+        self._lst.config(text=disp, fg=col)
+        self._dv.itemconfig(self._dot, fill=col)
+        if s == "connected":
+            self._bconn.config(state=tk.DISABLED)
+            self._bdisc.config(state=tk.NORMAL)
             self._connected = True
-            self._start_screen_loop()
-        elif status == "disconnected":
-            self._lbl_status.config(text=display, fg=DIM)
-            self._status_dot_color(DIM)
-            self._btn_connect.config(state=tk.NORMAL)
-            self._btn_disconnect.config(state=tk.DISABLED)
+            self._start_scr()
+        elif s == "disconnected":
+            self._bconn.config(state=tk.NORMAL)
+            self._bdisc.config(state=tk.DISABLED)
             self._connected = False
-            self._stop_screen_loop()
-        elif status.startswith("error"):
-            self._lbl_status.config(text=f"✕ {status.upper()}", fg=ROSE)
-            self._status_dot_color(ROSE)
-        elif status == "token_warning":
-            self._lbl_status.config(text=display, fg=AMBER)
-        else:
-            self._lbl_status.config(text=display, fg=CYAN)
+            self._stop_scr()
 
-        # Only log meaningful status changes, not every turn_complete
-        if status not in ("turn_complete", "interrupted"):
-            self._log_append(status, "act")
+    def _onev(self, evt: ActionEvent):
+        ts  = _time.strftime("%H:%M:%S", _time.localtime(evt.timestamp))
+        win = f"  [{evt.window[:28]}]" if evt.window else ""
+        txt = f"{ts}  {evt.action}: {evt.detail[:52]}{win}"
+        self._add_step(txt, done=evt.success, error=not evt.success)
+        if evt.state == TaskState.COMPLETED:
+            self._show_done()
 
-    def _on_action_event(self, event: ActionEvent):
-        """Display a real desktop action in the log."""
-        import time as _time
-        ts = _time.strftime("%H:%M:%S", _time.localtime(event.timestamp))
-        tag = "ok" if event.success else "err"
-        short = event.detail[:80]
-        win = f" [{event.window[:40]}]" if event.window else ""
-        self._log_append(f"{ts} {event.action}: {short}{win}", tag)
-        self._task_progress_lbl.config(text=f"→ {event.action}: {short}"[:80])
-
-    def _update_meter(self, rms: float):
+    def _onrms(self, rms):
         w = self._meter.winfo_width()
-        if w <= 1:
+        if w > 1:
+            self._meter.coords(self._mbar, 0, 0,
+                               min(int(rms/800*w), w), 3)
+
+    # ─────────────────────────────────────────────────────────────────────
+    # CONTROLS
+    # ─────────────────────────────────────────────────────────────────────
+    def _send(self):
+        t = self._inp.get().strip()
+        if not t or t == "Type a task…":
             return
-        fill_w = min(int(rms / 800 * w), w)
-        self._meter.coords(self._meter_bar, 0, 0, fill_w, 4)
+        self._inp.delete(0, tk.END)
+        self._apptx("user", t)
+        self._clear_steps()
+        self._session.send_text(t)
 
-    def _status_dot_color(self, color: str):
-        self._status_dot.itemconfig(self._dot_oval, fill=color)
-
-    def _log_append(self, text: str, tag: str = ""):
-        self._log.config(state=tk.NORMAL)
-        self._log.insert("1.0", text + "\n", tag)
-        lines = int(self._log.index(tk.END).split(".")[0]) - 1
-        if lines > 100:
-            self._log.delete(f"{lines - 100}.0", tk.END)
-        self._log.config(state=tk.DISABLED)
-
-    # ------------------------------------------------------------------ #
-    # User actions
-    # ------------------------------------------------------------------ #
-
-    def _clear_placeholder(self, event):
-        if self._input.get() == "Type a task or interrupt the agent…":
-            self._input.delete(0, tk.END)
-
-    def _on_send(self):
-        text = self._input.get().strip()
-        if not text or text == "Type a task or interrupt the agent…":
-            return
-        self._input.delete(0, tk.END)
-        log.info("user sent: %d chars", len(text))
-        self._append_transcript_line("user", text)
-        self._session.send_text(text)
-
-    def _on_connect(self):
-        log.info("connect clicked")
-        self._btn_connect.config(state=tk.DISABLED)
+    def _on_conn(self):
+        self._bconn.config(state=tk.DISABLED)
         asyncio.run_coroutine_threadsafe(self._session.start(), self._loop)
 
-    def _on_disconnect(self):
-        log.info("disconnect clicked")
-        self._btn_disconnect.config(state=tk.DISABLED)
+    def _on_disc(self):
+        self._bdisc.config(state=tk.DISABLED)
         asyncio.run_coroutine_threadsafe(self._session.stop(), self._loop)
 
-    def _toggle_minimize(self):
-        self._minimized = not self._minimized
-        if self._minimized:
-            self._body.pack_forget()
-            self._btn_min.config(text="□")
-            self._root.geometry(f"{self._cfg.ui.window_width}x42+{self._screen_right()}+80")
+    def _toggle_col(self):
+        self._collapsed = not self._collapsed
+        if self._collapsed:
+            self._scroll_frame.pack_forget()
+            self._bcol.config(text="∨")
+            self._root.geometry(f"{self.W}x{self.H_MINI}+{self._rx()}+60")
         else:
-            self._body.pack(fill=tk.BOTH, expand=True)
-            self._btn_min.config(text="−")
-            self._root.geometry(
-                f"{self._cfg.ui.window_width}x{self._cfg.ui.window_height}+{self._screen_right()}+80"
-            )
+            # re-insert scroll_frame after the status label's separator
+            self._scroll_frame.pack(fill=tk.BOTH, expand=True)
+            self._bcol.config(text="∧")
+            self._root.geometry(f"{self.W}x{self.H_FULL}+{self._rx()}+60")
 
     def _on_close(self):
-        log.info("app closing")
         if self._connected and self._loop:
             asyncio.run_coroutine_threadsafe(self._session.stop(), self._loop)
-        self._stop_screen_loop()
-        def _shutdown():
-            import time as _t
-            _t.sleep(0.6)
-            # Terminate PyAudio fully on exit
+        self._stop_scr()
+        def _sh():
+            _time.sleep(0.5)
             try:
                 self._session._audio_in.terminate()
                 self._session._audio_out.terminate()
@@ -403,63 +435,120 @@ class App:
                 pass
             if self._loop:
                 self._loop.call_soon_threadsafe(self._loop.stop)
-        import threading as _threading
-        _threading.Thread(target=_shutdown, daemon=True).start()
-        self._root.after(700, self._root.destroy)
+        threading.Thread(target=_sh, daemon=True).start()
+        self._root.after(600, self._root.destroy)
 
-    # ------------------------------------------------------------------ #
-    # Drag
-    # ------------------------------------------------------------------ #
+    # ─────────────────────────────────────────────────────────────────────
+    # DRAG
+    # ─────────────────────────────────────────────────────────────────────
+    def _bind_drag(self):
+        for w in [self._hdr] + list(self._hdr.winfo_children()):
+            w.bind("<ButtonPress-1>", self._ds)
+            w.bind("<B1-Motion>",     self._dm)
 
-    def _setup_drag(self):
-        self._drag_x = 0
-        self._drag_y = 0
-        self._titlebar.bind("<ButtonPress-1>", self._drag_start)
-        self._titlebar.bind("<B1-Motion>", self._drag_move)
+    def _ds(self, e):
+        self._dx = e.x_root - self._root.winfo_x()
+        self._dy = e.y_root - self._root.winfo_y()
 
-    def _drag_start(self, event):
-        self._drag_x = event.x_root - self._root.winfo_x()
-        self._drag_y = event.y_root - self._root.winfo_y()
+    def _dm(self, e):
+        self._root.geometry(f"+{e.x_root-self._dx}+{e.y_root-self._dy}")
 
-    def _drag_move(self, event):
-        x = event.x_root - self._drag_x
-        y = event.y_root - self._drag_y
-        self._root.geometry(f"+{x}+{y}")
+    # ─────────────────────────────────────────────────────────────────────
+    # SCREEN LOOP
+    # ─────────────────────────────────────────────────────────────────────
+    def _start_scr(self):
+        self._scrtick(int(self._cfg.screen.capture_interval_s * 1000))
 
-    # ------------------------------------------------------------------ #
-    # Screen frame loop — sends real screenshots to Gemini while connected
-    # ------------------------------------------------------------------ #
+    def _stop_scr(self):
+        if self._stid:
+            self._root.after_cancel(self._stid)
+            self._stid = None
 
-    def _start_screen_loop(self):
-        interval_ms = int(self._cfg.screen.capture_interval_s * 1000)
-        self._screen_loop_tick(interval_ms)
-
-    def _stop_screen_loop(self):
-        if self._screen_timer_id:
-            self._root.after_cancel(self._screen_timer_id)
-            self._screen_timer_id = None
-
-    def _screen_loop_tick(self, interval_ms: int):
+    def _scrtick(self, ms):
         if not self._connected:
             return
         try:
-            frame = self._observer.capture()
-            self._session.submit_frame(frame.jpeg_bytes)
+            f = self._obs.capture()
+            self._session.submit_frame(f.jpeg_bytes)
         except Exception as e:
-            log.warning("screen loop error: %s", e)
-        self._screen_timer_id = self._root.after(interval_ms, lambda: self._screen_loop_tick(interval_ms))
+            log.warning("screen loop: %s", e)
+        self._stid = self._root.after(ms, lambda: self._scrtick(ms))
 
-    # ------------------------------------------------------------------ #
-    # Run
-    # ------------------------------------------------------------------ #
-
+    # ─────────────────────────────────────────────────────────────────────
+    # RUN
+    # ─────────────────────────────────────────────────────────────────────
     def run(self):
         self._loop = asyncio.new_event_loop()
-        t = threading.Thread(target=self._loop.run_forever, daemon=True, name="asyncio-loop")
-        t.start()
+        threading.Thread(target=self._loop.run_forever,
+                         daemon=True, name="asyncio").start()
         log.info("App started")
         self._root.mainloop()
 
 
-def config_app_name(cfg: AppConfig) -> str:
-    return cfg.app_name
+# ─────────────────────────────────────────────────────────────────────────────
+# StepRow
+# ─────────────────────────────────────────────────────────────────────────────
+class StepRow:
+    _SP = ("⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏")
+
+    def __init__(self, parent, text, done=False, error=False):
+        self._p   = parent
+        self._job = None
+        self._i   = 0
+
+        self._f = tk.Frame(parent, bg=PANEL)
+        self._f.pack(fill=tk.X, pady=3)
+
+        ic = GREEN if done else (ROSE if error else ACCENT)
+        it = "✔"   if done else ("✘"  if error else self._SP[0])
+        self._ic = tk.Label(self._f, text=it, bg=PANEL, fg=ic,
+                            font=("Segoe UI", 11), width=2)
+        self._ic.pack(side=tk.LEFT, padx=(4, 6))
+
+        self._lb = tk.Label(self._f, text=text,
+                            bg=PANEL, fg=MID if done else TEXT,
+                            font=("Segoe UI", 9),
+                            anchor="w", justify=tk.LEFT,
+                            wraplength=290)
+        self._lb.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(0, 6))
+
+        if not done and not error:
+            self._spin()
+
+    def _spin(self):
+        self._i = (self._i + 1) % len(self._SP)
+        try:
+            self._ic.config(text=self._SP[self._i])
+            self._job = self._p.after(90, self._spin)
+        except tk.TclError:
+            pass
+
+    def mark_done(self):
+        self._stop()
+        try:
+            self._ic.config(text="✔", fg=GREEN)
+            self._lb.config(fg=MID)
+        except tk.TclError:
+            pass
+
+    def mark_error(self):
+        self._stop()
+        try:
+            self._ic.config(text="✘", fg=ROSE)
+            self._lb.config(fg=ROSE)
+        except tk.TclError:
+            pass
+
+    def _stop(self):
+        if self._job:
+            try:
+                self._p.after_cancel(self._job)
+            except Exception:
+                pass
+
+    def destroy(self):
+        self._stop()
+        try:
+            self._f.destroy()
+        except Exception:
+            pass

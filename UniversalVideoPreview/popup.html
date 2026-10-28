@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Universal Video Preview</title>
+<style>
+body{width:260px;margin:0;padding:16px;font:13px/1.45 "Segoe UI",Arial,sans-serif;background:#17191d;color:#f2f3f5}
+h1{font-size:16px;margin:0 0 8px;font-weight:650}
+p{color:#b9bec7;margin:0 0 14px}
+button{width:100%;border:0;border-radius:7px;padding:10px;font-weight:650;cursor:pointer;background:#4f8ef7;color:#fff;transition:background .15s}
+button.off{background:#343943;color:#f2f3f5}
+button:disabled{opacity:.5;cursor:default}
+.status{margin-top:10px;color:#aeb5c0;font-size:12px}
+</style></head>
+<body>
+<h1>Universal Video Preview</h1>
+<p>Hover over video thumbnails to preview them — muted &amp; looping. Multiple at once.</p>
+<button id="toggle">Checking page...</button>
+<div class="status" id="status"></div>
+<script src="popup.js"></script>
+</body></html>
