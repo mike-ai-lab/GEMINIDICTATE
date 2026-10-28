@@ -1,5 +1,17 @@
 [
   {
+    "id": 1791662006,
+    "title": "CHECK THIS SCRIPT:",
+    "time": "10:53 PM",
+    "text": "CHECK THIS SCRIPT:\n\nC:\\Users\\Administrator\\Desktop\\PARAMETRIX_WORKING_VERSION\\standard-wall-generator.rb\n\nI WANT U TO TELL ME WHAT SHOULD BE DONE IN RDER T MAKE IT PROFESSIONALLY PACKED IN A DIRECTORY, WITH MODIULAR CODE FILES, LOADER, AND LOGICS, SO I DONT GET A MONOLITHIC CODE SOON, I WANT TO KEEP IT SCALABLE, DEBUGGING-EASY, AND MANAGEABLE, AND ADD A TOLBAR BUTTON, \n\nWRITE THE CORRECT PROMPT SO I SEND IT TO KIRO TO REFACTOR IT, WITHUT OVER-ENGINEERING OR UNNECESSARY TIME WASTING, JUST MANAGING AND HANDLING IT PROPERLY"
+  },
+  {
+    "id": 1791145289,
+    "title": "When using the integrated PowerShell terminal, always execut",
+    "time": "11:21 PM",
+    "text": "When using the integrated PowerShell terminal, always execute commands as complete, directly executable commands. Never leave PowerShell at a `>>` continuation prompt or require me to press Enter manually. Avoid multiline `python -c` commands; use a properly escaped single-line command instead. Do not create temporary script files just to work around this issue; use direct commands whenever possible. Only use a script file when the task genuinely requires one. Do not wait for interactive input unless the program itself genuinely requires it."
+  },
+  {
     "id": 1789905871,
     "title": "fixed and deplyed verified!",
     "time": "3:04 PM",

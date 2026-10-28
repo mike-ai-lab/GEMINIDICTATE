@@ -811,6 +811,9 @@ def _scr_on_status(status):
 
 def _scr_on_caption(speaker, text):
     L("SCR CAPTION speaker=%r text=%r", speaker, text[:60] if text else "")
+    # Drop noise-only transcription fragments — they clutter the chat log
+    if speaker == "user_chunk" and text and text.strip() in ("<noise>", "[noise]", "(noise)"):
+        return
     root.after(0, _scr_push_message, speaker, text)
 
 
@@ -1104,6 +1107,8 @@ function Test-IsEditable($elem) {
         if ($cls -match '^Edit$')  { return $true }
         # Accept known editable class names (ProseMirror, CodeMirror, etc.)
         if ($cls -match 'ProseMirror|CodeMirror|ace_text|RichEdit|Scintilla') { return $true }
+        # Tkinter Text widget — ClassName is TkChild, IsKeyboardFocusable is False but it IS editable
+        if ($cls -match '^TkChild$') { return $true }
         # Fallback: ValuePattern or TextPattern
         if (-not $p.IsKeyboardFocusable) { return $false }
         try {
@@ -1299,6 +1304,10 @@ def is_editable_uia(u):
                         "richedit", "scintilla", "textbox", "textarea")
     if any(c in cls_lower for c in editable_classes):
         return True
+    # Tkinter Text widget — ClassName is "TkChild", ControlType is "ControlType.Pane"
+    # IsKeyboardFocusable is False for these but they are genuine text inputs
+    if cls == "TkChild" and ct in ("controltype.pane", "controltype.edit"):
+        return True
     return False
 
 
@@ -1488,9 +1497,28 @@ def clipboard_restore_text(text, had_text):
     return False, "OpenClipboard failed while clearing clipboard"
 
 
-def restore_saved_clipboard(reason=""):
-    """Restore the original clipboard unless a paste fallback is active."""
+def _clear_clipboard_history():
+    """Clear Windows Clipboard History, leaving no dictation fragments behind.
+    Only called at full session end — not during mid-session segment restores."""
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+             "[Windows.ApplicationModel.DataTransfer.Clipboard, Windows, ContentType = WindowsRuntime]"
+             "::ClearHistory() | Out-Null"],
+            creationflags=0x08000000,  # CREATE_NO_WINDOW
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+    except Exception as e:
+        L("CLIPBOARD HISTORY CLEAR ERROR: %s", e)
+
+
+def restore_saved_clipboard(reason="", clear_history=False):
+    """Restore the original clipboard unless a paste fallback is active.
+    Pass clear_history=True at session end to wipe all intermediate fragments
+    from Windows Clipboard History before restoring the user's original content."""
     global saved_clipboard_text, saved_clipboard_has_text, fallback_clipboard_text, fallback_active
+    if clear_history:
+        _clear_clipboard_history()
     if fallback_active and fallback_clipboard_text:
         ok, detail = clipboard_restore_text(fallback_clipboard_text, True)
         L("CLIPBOARD RESTORE FALLBACK ok=%s reason=%r chars=%d detail=%s", ok, reason, len(fallback_clipboard_text), detail)
@@ -1536,6 +1564,15 @@ def clipboard_set_and_verify(text):
     try:
         if not user32.EmptyClipboard():
             return False, "EmptyClipboard failed"
+        # Exclude this write from Windows Clipboard History so intermediate
+        # dictation segments don't pollute the history or override user content.
+        # CF 0xC0CB = ExcludeClipboardContentFromMonitorProcessing (Windows 10+)
+        # Only suppress during active recording — restores go back into history normally.
+        try:
+            if recording:
+                user32.SetClipboardData(0xC0CB, None)
+        except Exception:
+            pass
         h = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
         if not h:
             return False, "GlobalAlloc failed"
@@ -3209,6 +3246,12 @@ def poll_result():
         focus_status.set(" Dictate")
         state_label.config(fg=MUTED)
         show_clipboard_fallback(False)
+        # Guarantee clipboard is restored to the user's original content.
+        # This catches drain-timeout paths where per-segment restore may not
+        # have fired for the last progressive batch.
+        if not fallback_active:
+            _ok, _detail = restore_saved_clipboard("session end cleanup", clear_history=True)
+            L("CLIPBOARD SESSION END RESTORE ok=%s detail=%s", _ok, _detail)
 
 
 def set_mode(new_mode):

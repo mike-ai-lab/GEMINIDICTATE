@@ -18,6 +18,37 @@ Thumbs.db
 # Screenshots and temp images
 *.png
 
+# Agent debug frames — regenerated on every run, can be hundreds of files
+GEM-AGENT/logs/frames/
+
+# Session logs — regenerated on every run
+GEM-AGENT/logs/*.log
+GEM-AGENT/logs/*.log.*
+logs/
+
+# Crash and error dumps
+crash.log
+crash2.log
+conv_err.log
+conv_ui_test.err
+err.txt
+err2.txt
+err_new.txt
+mic_test_live.log
+scr_test.log
+
+# PID files
+*.pid
+
+# Gemini dictate runtime files
+gemini_dictate.log
+gemini_dictate.log.bk
+gemini_dictate_notes.json
+notes.json
+
+# Wav/audio test files
+*.wav
+
 # Node dependencies — install locally with npm install
 node_modules/
 
